@@ -1,0 +1,5 @@
+build
+/.env
+*.sqlite3
+jpm_tree/
+.cpcache/

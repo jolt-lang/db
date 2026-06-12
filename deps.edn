@@ -1,0 +1,12 @@
+{:paths ["clj"]
+
+ ;; Janet-side drivers: sqlite is the default battery; postgres needs
+ ;; janet-pq (jpm install https://github.com/andrewchambers/janet-pq) and a
+ ;; libpq on the system — declared by consumers that use it.
+ :deps {janet/sqlite3 {:jpm/module "sqlite3"
+                       :jpm/install "sqlite3"}}
+
+ :aliases {:test {:extra-paths ["clj-test"]
+                  :main-opts ["-m" "jdbc.core-test"]}}
+
+ :tasks {test "jolt-deps -M:test"}}

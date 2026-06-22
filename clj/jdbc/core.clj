@@ -24,7 +24,7 @@
   (cond
     (str/starts-with? s "postgres")  {:vendor "postgresql" :uri s}
     (str/starts-with? s "sqlite:")   {:vendor "sqlite" :name (subs s 7)}
-    ;; bare path = sqlite file, matching the db janet library's convention
+    ;; bare path = sqlite file
     :else                            {:vendor "sqlite" :name s}))
 
 (defn- pg-uri [{:keys [uri name host port user password]}]

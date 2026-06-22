@@ -5,10 +5,9 @@
   sqlite-only app never needs libpq present."
   (:require [jolt.ffi :as ffi]))
 
-(def ^:private lib
-  (or (some #(when (ffi/loaded? %) %)
-            ["libpq.5.dylib" "libpq.dylib" "libpq.so.5" "libpq.so"])
-      (throw (ex-info "db.pg: libpq not found" {}))))
+;; libpq is declared in deps.edn (:jolt/native, :optional) and loaded by jolt at
+;; startup when present; jdbc.core only requires this namespace for a postgres
+;; connection, so a sqlite-only app never needs libpq.
 
 (ffi/defcfn PQconnectdb        "PQconnectdb"        [:string] :pointer)
 (ffi/defcfn PQstatus           "PQstatus"           [:pointer] :int)

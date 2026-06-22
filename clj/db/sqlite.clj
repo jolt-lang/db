@@ -5,11 +5,8 @@
   (:require [jolt.ffi :as ffi]
             [clojure.string :as str]))
 
-;; --- load libsqlite3 (cross-platform) ---------------------------------------
-(def ^:private lib
-  (or (some #(when (ffi/loaded? %) %)
-            ["libsqlite3.0.dylib" "libsqlite3.dylib" "libsqlite3.so.0" "libsqlite3.so"])
-      (throw (ex-info "db.sqlite: libsqlite3 not found" {}))))
+;; libsqlite3 is declared in deps.edn (:jolt/native) and loaded by jolt before
+;; this namespace is required, so the bindings below resolve.
 
 ;; --- bindings ----------------------------------------------------------------
 (ffi/defcfn sqlite3-open          "sqlite3_open"          [:string :pointer] :int)

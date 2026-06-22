@@ -65,7 +65,7 @@
            (jdbc/execute! c "create table t (x integer)")
            (jdbc/insert! c :t {:x 7})))
 
-  (when-let [pg-uri (janet.os/getenv "JOLT_TEST_PG_URI")]
+  (when-let [pg-uri (System/getenv "JOLT_TEST_PG_URI")]
     (println "jdbc.core over postgres (" pg-uri ")")
     (with-open [conn (jdbc/connection pg-uri)]
       (jdbc/execute! conn "drop table if exists jolt_person")
@@ -91,5 +91,5 @@
       (jdbc/execute! conn "drop table jolt_person")))
 
   (if (pos? @failures)
-    (do (println @failures "failing check(s)") (janet.os/exit 1))
+    (throw (ex-info "test failures" {:n @failures}))
     (println "all checks passed")))

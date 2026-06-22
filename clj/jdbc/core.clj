@@ -68,12 +68,12 @@
       ;; db.pg (and libpq) load lazily — only when a postgres connection is made,
       ;; so a sqlite-only app never needs libpq present.
       (do (require '[db.pg])
-          (let [h (db.pg/connect (pg-uri spec))]
+          (let [h ((pgfn "connect") (pg-uri spec))]
             {:vendor   :postgresql
              :handle   h
              :depth    (atom 0)
              :rollback (atom false)
-             :close    (fn [] (db.pg/close h))})))))
+             :close    (fn [] ((pgfn "close") h))})))))
 
 ;;; queries
 
@@ -98,8 +98,12 @@
 (defn- sqlite-eval [conn sql params]
   (sqlite/query (:handle conn) sql params))
 
+;; db.pg is required lazily (only for a postgres connection), so resolve its fns
+;; at runtime — a compile-time db.pg/foo reference would be read as a host class.
+(defn- pgfn [n] (deref (resolve (symbol "db.pg" n))))
+
 (defn- pg-eval [conn sql params]
-  (db.pg/exec (:handle conn) (pg-placeholders sql) params))
+  ((pgfn "exec") (:handle conn) (pg-placeholders sql) params))
 
 (defn fetch
   "Run a query (string or sqlvec), return a vector of keyword-keyed row maps."
@@ -108,7 +112,7 @@
    (let [[sql params] (sqlvec q)
          rows (case (:vendor conn)
                 :sqlite     (sqlite-eval conn sql params)
-                :postgresql (db.pg/all (:handle conn) (pg-placeholders sql) params))]
+                :postgresql ((pgfn "all") (:handle conn) (pg-placeholders sql) params))]
      (if-let [n (:max-rows opts)] (vec (take n rows)) rows))))
 
 (defn fetch-one
@@ -131,7 +135,7 @@
   [conn]
   (case (:vendor conn)
     :sqlite     (sqlite/last-insert-rowid (:handle conn))
-    :postgresql (:id (first (db.pg/all (:handle conn) "select lastval() as id" [])))))
+    :postgresql (:id (first ((pgfn "all") (:handle conn) "select lastval() as id" [])))))
 
 ;;; insert! / update! / delete! — the clojure.jdbc convenience surface
 

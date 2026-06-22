@@ -1,0 +1,27 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: jolt_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Chez + libpq
+        run: |
+          sudo apt-get update && sudo apt-get install -y chezscheme libpq5 libsqlite3-0
+          if ! command -v chez >/dev/null 2>&1; then
+            printf '#!/bin/sh\nexec scheme "$@"\n' | sudo tee /usr/local/bin/chez >/dev/null
+            sudo chmod +x /usr/local/bin/chez
+          fi
+      - name: Get jolt
+        run: git clone --depth 1 --recurse-submodules https://github.com/jolt-lang/jolt.git "$HOME/jolt"
+      - name: Test (sqlite + postgres)
+        run: JOLT_TEST_PG_URI=postgres://postgres:postgres@127.0.0.1:5432/jolt_test JOLT_PWD="$PWD" "$HOME/jolt/bin/joltc" -M:test

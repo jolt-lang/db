@@ -1,9 +1,9 @@
 (ns jdbc.core
   "clojure.jdbc's API (https://github.com/yogthos/clojure.jdbc) for jolt,
-  over Janet database drivers instead of java.sql:
+  over native database drivers (bound through jolt.ffi) instead of java.sql:
 
-  - SQLite via janet-lang/sqlite3   (jpm install sqlite3)
-  - PostgreSQL via andrewchambers/janet-pq (jpm install janet-pq)
+  - SQLite via db.sqlite (the system libsqlite3)
+  - PostgreSQL via db.pg (the system libpq)
 
   Connections are plain maps carrying the driver handle plus a :close fn, so
   `with-open` works. Queries are strings or sqlvecs ([sql & params], JDBC ?
@@ -15,7 +15,8 @@
         (jdbc/execute! conn \"create table p (id integer primary key, name text)\")
         (jdbc/insert! conn :p {:name \"ada\"})
         (jdbc/fetch conn [\"select * from p where name = ?\" \"ada\"]))"
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [db.sqlite :as sqlite]))
 
 ;;; dbspec
 
@@ -56,20 +57,23 @@
   (let [{:keys [vendor] :as spec} (normalize-spec spec)]
     (case vendor
       "sqlite"
-      (let [h (janet.sqlite3/open (:name spec))]
-        (janet.sqlite3/eval h "PRAGMA foreign_keys=1;")
+      (let [h (sqlite/open (:name spec))]
+        (sqlite/query h "PRAGMA foreign_keys=1;" [])
         {:vendor   :sqlite
          :handle   h
          :depth    (atom 0)
          :rollback (atom false)
-         :close    (fn [] (janet.sqlite3/close h))})
+         :close    (fn [] (sqlite/close h))})
       "postgresql"
-      (let [h (janet.pq/connect (pg-uri spec))]
-        {:vendor   :postgresql
-         :handle   h
-         :depth    (atom 0)
-         :rollback (atom false)
-         :close    (fn [] (janet.pq/close h))}))))
+      ;; db.pg (and libpq) load lazily — only when a postgres connection is made,
+      ;; so a sqlite-only app never needs libpq present.
+      (do (require '[db.pg])
+          (let [h ((pgfn "connect") (pg-uri spec))]
+            {:vendor   :postgresql
+             :handle   h
+             :depth    (atom 0)
+             :rollback (atom false)
+             :close    (fn [] ((pgfn "close") h))})))))
 
 ;;; queries
 
@@ -92,25 +96,14 @@
           :else (recur (str out c) (inc i) n in-str))))))
 
 (defn- sqlite-eval [conn sql params]
-  (if (seq params)
-    (janet.sqlite3/eval (:handle conn) sql (apply janet/tuple params))
-    (janet.sqlite3/eval (:handle conn) sql)))
+  (sqlite/query (:handle conn) sql params))
+
+;; db.pg is required lazily (only for a postgres connection), so resolve its fns
+;; at runtime — a compile-time db.pg/foo reference would be read as a host class.
+(defn- pgfn [n] (deref (resolve (symbol "db.pg" n))))
 
 (defn- pg-eval [conn sql params]
-  (apply janet.pq/exec (:handle conn) (pg-placeholders sql) params))
-
-(defn- pg-value
-  "janet-pq decodes bigint/serial8 columns as boxed s64/u64 — bring those
-  back as jolt numbers."
-  [v]
-  (case (janet/type v)
-    (:core/s64 :core/u64) (janet.int/to-number v)
-    v))
-
-(defn- pg-row [row]
-  (reduce (fn [m kv] (assoc m (nth kv 0) (pg-value (nth kv 1))))
-          {}
-          (janet/pairs row)))
+  ((pgfn "exec") (:handle conn) (pg-placeholders sql) params))
 
 (defn fetch
   "Run a query (string or sqlvec), return a vector of keyword-keyed row maps."
@@ -118,10 +111,8 @@
   ([conn q opts]
    (let [[sql params] (sqlvec q)
          rows (case (:vendor conn)
-                :sqlite     (into [] (sqlite-eval conn sql params))
-                :postgresql (mapv pg-row
-                                  (apply janet.pq/all (:handle conn)
-                                         (pg-placeholders sql) params)))]
+                :sqlite     (sqlite-eval conn sql params)
+                :postgresql ((pgfn "all") (:handle conn) (pg-placeholders sql) params))]
      (if-let [n (:max-rows opts)] (vec (take n rows)) rows))))
 
 (defn fetch-one
@@ -136,16 +127,15 @@
    (let [[sql params] (sqlvec q)]
      (case (:vendor conn)
        :sqlite     (do (sqlite-eval conn sql params)
-                       (get (first (janet.sqlite3/eval (:handle conn) "select changes() as n"))
-                            :n 0))
+                       (sqlite/changes (:handle conn)))
        :postgresql (do (pg-eval conn sql params) nil)))))
 
 (defn last-insert-id
   "Driver-specific id of the last inserted row (sqlite: last_insert_rowid)."
   [conn]
   (case (:vendor conn)
-    :sqlite     (janet.sqlite3/last-insert-rowid (:handle conn))
-    :postgresql (pg-value (get (first (janet.pq/all (:handle conn) "select lastval() as id")) :id))))
+    :sqlite     (sqlite/last-insert-rowid (:handle conn))
+    :postgresql (:id (first ((pgfn "all") (:handle conn) "select lastval() as id" [])))))
 
 ;;; insert! / update! / delete! — the clojure.jdbc convenience surface
 

@@ -20,6 +20,26 @@ no JVM: the native binding lives in this library.
 supported on both backends. Queries are strings or sqlvecs (`[sql & params]`,
 JDBC `?` placeholders — rewritten to `$N` for postgres).
 
+## Binary values
+
+A byte array parameter binds as a SQLite `blob` / postgres `bytea`, and those
+columns read back as byte arrays. The bytes round-trip exactly, so embedded NULs,
+non-UTF-8 bytes, and empty payloads all survive.
+
+```clojure
+(jdbc/execute! conn "create table doc (id integer primary key, body blob)")
+(jdbc/insert! conn :doc {:body (byte-array [0 255 65])})
+(:body (jdbc/fetch-one conn "select body from doc"))   ; -> byte array
+```
+
+## Errors
+
+Database errors are `ex-info` values carrying `:jdbc/sql-error true` in their
+`ex-data`, and they also satisfy `(catch java.sql.SQLException ...)` so code
+written against the JDBC contract works unchanged. Migratus depends on this: its
+`table-exists?` probe catches `SQLException` to decide whether it still needs to
+create `schema_migrations`.
+
 ## Layout
 
 - `db.sqlite` / `db.pg` — the native drivers (jolt.ffi bindings).
@@ -29,12 +49,12 @@ JDBC `?` placeholders — rewritten to `$N` for postgres).
 
 ## Requirements
 
-`joltc` on PATH; the system `libsqlite3` (preinstalled on macOS and most Linux
+`jolt` on PATH; the system `libsqlite3` (preinstalled on macOS and most Linux
 distros). PostgreSQL support additionally needs `libpq` at runtime.
 
 ## Test
 
 ```bash
-joltc -M:test                              # sqlite
-JOLT_TEST_PG_URI=postgres://... joltc -M:test   # also runs the postgres suite
+jolt -M:test                                   # sqlite
+JOLT_TEST_PG_URI=postgres://... jolt -M:test   # also runs the postgres suite
 ```

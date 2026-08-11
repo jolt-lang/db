@@ -19,9 +19,12 @@
 (ffi/defcfn sqlite3-column-name   "sqlite3_column_name"   [:pointer :int] :string)
 (ffi/defcfn sqlite3-column-type   "sqlite3_column_type"   [:pointer :int] :int)
 (ffi/defcfn sqlite3-column-text   "sqlite3_column_text"   [:pointer :int] :string)
+(ffi/defcfn sqlite3-column-blob   "sqlite3_column_blob"   [:pointer :int] :pointer)
+(ffi/defcfn sqlite3-column-bytes  "sqlite3_column_bytes"  [:pointer :int] :int)
 (ffi/defcfn sqlite3-column-int64  "sqlite3_column_int64"  [:pointer :int] :int64)
 (ffi/defcfn sqlite3-column-double "sqlite3_column_double" [:pointer :int] :double)
 (ffi/defcfn sqlite3-bind-text     "sqlite3_bind_text"     [:pointer :int :string :int :iptr] :int)
+(ffi/defcfn sqlite3-bind-blob     "sqlite3_bind_blob"     [:pointer :int :pointer :int :iptr] :int)
 (ffi/defcfn sqlite3-bind-int64    "sqlite3_bind_int64"    [:pointer :int :int64] :int)
 (ffi/defcfn sqlite3-bind-double   "sqlite3_bind_double"   [:pointer :int :double] :int)
 (ffi/defcfn sqlite3-bind-null     "sqlite3_bind_null"     [:pointer :int] :int)
@@ -31,10 +34,10 @@
 (def ^:private SQLITE-OK 0)
 (def ^:private SQLITE-ROW 100)
 (def ^:private SQLITE-DONE 101)
-(def ^:private SQLITE-TRANSIENT -1)        ; tell sqlite to copy the bound text
+(def ^:private SQLITE-TRANSIENT -1)        ; tell sqlite to copy the bound data
 
 ;; column storage classes (sqlite3_column_type)
-(def ^:private TY-INT 1) (def ^:private TY-FLOAT 2) (def ^:private TY-NULL 5)
+(def ^:private TY-INT 1) (def ^:private TY-FLOAT 2) (def ^:private TY-BLOB 4) (def ^:private TY-NULL 5)
 
 ;; --- connection --------------------------------------------------------------
 (defn open
@@ -58,6 +61,13 @@
       (let [v (first ps)]
         (cond
           (nil? v)                       (sqlite3-bind-null stmt i)
+          (bytes? v)                     (let [n (alength v)
+                                               ptr (ffi/alloc (max 1 n))]
+                                           (try
+                                             (ffi/write-array ptr v)
+                                             (sqlite3-bind-blob stmt i ptr n SQLITE-TRANSIENT)
+                                             (finally
+                                               (ffi/free ptr))))
           (and (integer? v) (int? v))    (sqlite3-bind-int64 stmt i v)
           (number? v)                    (sqlite3-bind-double stmt i (double v))
           (string? v)                    (sqlite3-bind-text stmt i v -1 SQLITE-TRANSIENT)
@@ -73,6 +83,8 @@
             v (cond
                 (= ty TY-INT)   (sqlite3-column-int64 stmt i)
                 (= ty TY-FLOAT) (sqlite3-column-double stmt i)
+                (= ty TY-BLOB)  (let [n (sqlite3-column-bytes stmt i)]
+                                  (ffi/read-array (sqlite3-column-blob stmt i) n))
                 (= ty TY-NULL)  nil
                 :else           (sqlite3-column-text stmt i))]
         (recur (inc i) (assoc m k v))))))

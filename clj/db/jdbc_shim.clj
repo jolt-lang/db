@@ -348,12 +348,18 @@
    "java.sql.DatabaseMetaData" :jdbc/dbmeta
    "java.sql.Savepoint"        :jdbc/savepoint})
 
+;; Answer true or nil, never false. nil means "not one of mine, keep looking",
+;; while false settles the question for every other library's check as well: the
+;; first non-nil answer wins. next.jdbc registers its own check so its connection
+;; wrapper answers instance? java.sql.Connection, which is how migratus picks its
+;; Connection branch, and returning false here silently overruled it.
 (clojure.core/__register-instance-check!
   (fn [cn val]
     (when-let [tag (get class-tags cn)]
       ;; a PreparedStatement is a Statement too
-      (boolean (or (tagged? val tag)
-                   (and (= cn "java.sql.Statement") (tagged? val :jdbc/prepared)))))))
+      (when (or (tagged? val tag)
+                (and (= cn "java.sql.Statement") (tagged? val :jdbc/prepared)))
+        true))))
 
 ;; Report the java.sql class name for (class x) and, more importantly, so a
 ;; protocol extended to java.sql.Connection dispatches on these values.

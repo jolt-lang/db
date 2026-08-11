@@ -1,6 +1,7 @@
 (ns next.jdbc
-  "A next.jdbc compatibility layer for jolt, over jdbc.core (which binds the
-  system db drivers via jolt.ffi). Just the surface migratus uses: get-connection,
+  "A next.jdbc compatibility layer for jolt, over jdbc.core — which is clojure.jdbc
+  itself, running on the java.sql shim in db.jdbc-shim above the native drivers.
+  Just the surface migratus uses: get-connection,
   execute!, execute-batch!, and the with-transaction macro. See next.jdbc.sql for
   insert!/delete!/query and next.jdbc.prepare for statement batching.
 

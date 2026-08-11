@@ -1,5 +1,10 @@
 (ns jdbc.core-test
-  (:require [jdbc.core :as jdbc]
+  ;; db.jdbc first: it registers the java.sql shim, which clojure.jdbc's
+  ;; namespaces resolve against as they compile, and points connection
+  ;; construction at the native drivers. jdbc.core below is the published
+  ;; clojure.jdbc running on top of it.
+  (:require [db.jdbc]
+            [jdbc.core :as jdbc]
             ;; the placeholder rewriter lives in the pg driver; requiring it here
             ;; lets the sqlite-only run cover the lexer table. Loading db.pg does
             ;; not need libpq present, only calling into it does.
@@ -18,10 +23,17 @@
   (with-open [conn (jdbc/connection "sqlite::memory:")]
     (check "execute! ddl" 0
            (jdbc/execute! conn "create table person (id integer primary key, name text, zip integer)"))
-    (check "insert! returns the id" 1 (jdbc/insert! conn :person {:name "ada" :zip 94546}))
-    (check "insert-multi! ids" [2 3]
+    ;; clojure.jdbc's insert! returns one result per row. Without :returning the
+    ;; shim hands back an empty generated-keys set, so each row reports its update
+    ;; count, which is how the API behaves on a driver with no generated keys.
+    (check "insert! returns a result per row" '(1)
+           (jdbc/insert! conn :person {:name "ada" :zip 94546}))
+    (check "insert-multi! returns a result per row" '(1 1)
            (jdbc/insert-multi! conn :person [{:name "grace" :zip 94546}
                                              {:name "alan" :zip 10001}]))
+    (check "insert! :returning gives the inserted row" {:id 4 :name "edsger" :zip 1}
+           (first (jdbc/insert! conn :person {:name "edsger" :zip 1} {:returning true})))
+    (jdbc/delete! conn :person ["name = ?" "edsger"])
     (check "fetch sqlvec with params" [{:id 1 :name "ada" :zip 94546}]
            (jdbc/fetch conn ["select * from person where name = ?" "ada"]))
     (check "fetch-one" {:id 3 :name "alan" :zip 10001}
@@ -40,7 +52,8 @@
     (doseq [[label payload] [["embedded NULs" (byte-array [65 0 66 0 67])]
                              ["non-UTF-8 bytes" (byte-array [-1 -2])]
                              ["empty payload" (byte-array [])]]]
-      (let [id (jdbc/insert! conn :payload {:content payload})
+      (let [id (:id (first (jdbc/insert! conn :payload {:content payload}
+                                         {:returning true})))
             actual (:content
                     (jdbc/fetch-one conn
                                     ["select content from payload where id = ?" id]))]
@@ -82,7 +95,7 @@
            (count (jdbc/fetch conn ["select * from person where name = ?" "marked"]))))
 
   (println "dbspec parsing")
-  (check "map spec works" 1
+  (check "map spec works" '(1)
          (with-open [c (jdbc/connection {:vendor "sqlite" :name ":memory:"})]
            (jdbc/execute! c "create table t (x integer)")
            (jdbc/insert! c :t {:x 7})))
@@ -144,7 +157,11 @@
     (with-open [conn (jdbc/connection pg-uri)]
       (jdbc/execute! conn "drop table if exists jolt_person")
       (jdbc/execute! conn "create table jolt_person (id serial primary key, name text, zip integer)")
-      (check "pg insert! returns the id" 1 (jdbc/insert! conn :jolt_person {:name "ada" :zip 94546}))
+      (check "pg insert! returns a result per row" '(1)
+             (jdbc/insert! conn :jolt_person {:name "ada" :zip 94546}))
+      (check "pg insert! :returning gives the inserted row" {:id 2 :name "hopper" :zip 3}
+             (first (jdbc/insert! conn :jolt_person {:name "hopper" :zip 3} {:returning true})))
+      (jdbc/delete! conn :jolt_person ["name = ?" "hopper"])
       (check "pg fetch with ? params" [{:id 1 :name "ada" :zip 94546}]
              (jdbc/fetch conn ["select * from jolt_person where name = ?" "ada"]))
       (jdbc/insert! conn :jolt_person {:name "grace" :zip 94546})
@@ -212,7 +229,8 @@
                                  ["every byte value" (byte-array (mapv (fn [i] (if (> i 127) (- i 256) i))
                                                                        (range 256)))]
                                  ["empty payload" (byte-array [])]]]
-          (let [id (jdbc/insert! conn :jolt_payload {:content payload})
+          (let [id (:id (first (jdbc/insert! conn :jolt_payload {:content payload}
+                                             {:returning true})))
                 actual (:content
                         (jdbc/fetch-one conn
                                         ["select content from jolt_payload where id = ?" id]))]

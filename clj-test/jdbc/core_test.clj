@@ -116,15 +116,25 @@
                (catch Exception _ :caught)))
       (jdbc/execute! conn "drop table if exists jolt_payload")
       (jdbc/execute! conn "create table jolt_payload (id serial primary key, content bytea not null)")
-      (doseq [[label payload] [["embedded NULs" (byte-array [65 0 66 0 67])]
-                               ["non-UTF-8 bytes" (byte-array [-1 -2])]
-                               ["empty payload" (byte-array [])]]]
-        (let [id (jdbc/insert! conn :jolt_payload {:content payload})
-              actual (:content
-                      (jdbc/fetch-one conn
-                                      ["select content from jolt_payload where id = ?" id]))]
-          (check (str "pg bytea " label " returns bytes") true (bytes? actual))
-          (check (str "pg bytea " label " round-trips") (vec payload) (vec actual))))
+      ;; bytea reads back as text, in whichever format bytea_output names, so run
+      ;; the round-trip under both. hex is the default and the only one a stock
+      ;; server exercises; escape is what older servers and anyone who has set it
+      ;; back will send, and its decoder is the easier of the two to get wrong.
+      (doseq [mode ["hex" "escape"]]
+        (jdbc/execute! conn (str "set bytea_output = '" mode "'"))
+        (doseq [[label payload] [["embedded NULs" (byte-array [65 0 66 0 67])]
+                                 ["non-UTF-8 bytes" (byte-array [-1 -2])]
+                                 ["backslashes and octal digits" (byte-array [92 92 48 48 48 92])]
+                                 ["every byte value" (byte-array (mapv (fn [i] (if (> i 127) (- i 256) i))
+                                                                       (range 256)))]
+                                 ["empty payload" (byte-array [])]]]
+          (let [id (jdbc/insert! conn :jolt_payload {:content payload})
+                actual (:content
+                        (jdbc/fetch-one conn
+                                        ["select content from jolt_payload where id = ?" id]))]
+            (check (str "pg bytea/" mode " " label " returns bytes") true (bytes? actual))
+            (check (str "pg bytea/" mode " " label " round-trips") (vec payload) (vec actual)))))
+      (jdbc/execute! conn "reset bytea_output")
       (jdbc/execute! conn "drop table jolt_payload")
       (jdbc/execute! conn "drop table jolt_person")))
 

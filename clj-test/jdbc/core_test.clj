@@ -105,7 +105,20 @@
                                        "select /* a /* ? */ ? */ $1 as c"]
              ["dollar quoted"          "select $$a?b$$ , ?"          "select $$a?b$$ , $1"]
              ["dollar quoted with tag" "select $tag$ ? $tag$, ?"     "select $tag$ ? $tag$, $1"]
+             ["dollar quote after an operator" "select 1 where x = $$?$$ or y = ?"
+                                              "select 1 where x = $$?$$ or y = $1"]
+             ;; postgres allows $ inside an identifier after the first character,
+             ;; so a$b$c is one name rather than a dollar quote opening
+             ["dollar inside an identifier"    "select note from t where a$b$c = ?"
+                                              "select note from t where a$b$c = $1"]
+             ["dollar inside an identifier, two params" "update t set note = ? where a$b$c = ?"
+                                                       "update t set note = $1 where a$b$c = $2"]
              ["escape string"          "select E'\\'?' , ?"          "select E'\\'?' , $1"]
+             ;; only a standalone E introduces backslash escapes; here the e ends
+             ;; an identifier, so this is a plain literal and the backslash is
+             ;; literal too, which leaves the ? after it a real placeholder
+             ["e ending an identifier is not an escape string" "select code'a\\' , ?"
+                                                              "select code'a\\' , $1"]
              ["unterminated literal"   "select '?"                   "select '?"]
              ["unterminated comment"   "select /* ?"                 "select /* ?"]]]
       (check (str "placeholders, " label) out (rewrite in)))
@@ -171,6 +184,16 @@
              (:c (jdbc/fetch-one conn ["select /* ? */ ? as c" "v"])))
       (check "pg ? inside a quoted identifier is left alone" "v"
              (:c (jdbc/fetch-one conn ["select ? as \"c\" /* ? */" "v"])))
+      ;; postgres accepts $ inside an identifier, and reading a$b$c as a dollar
+      ;; quote swallowed the rest of the statement and dropped the placeholder
+      (check "pg $ inside an identifier is not a dollar quote" "x"
+             (do (jdbc/execute! conn "drop table if exists jolt_dollar")
+                 (jdbc/execute! conn "create table jolt_dollar (a$b$c integer, note text)")
+                 (jdbc/execute! conn ["insert into jolt_dollar (a$b$c, note) values (?, ?)" 1 "x"])
+                 (let [v (:note (jdbc/fetch-one conn
+                                                ["select note from jolt_dollar where a$b$c = ?" 1]))]
+                   (jdbc/execute! conn "drop table jolt_dollar")
+                   v)))
       (jdbc/execute! conn "drop table if exists jolt_payload")
       (jdbc/execute! conn "create table jolt_payload (id serial primary key, content bytea not null)")
       ;; bytea reads back as text, in whichever format bytea_output names, so run

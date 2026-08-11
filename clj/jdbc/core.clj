@@ -111,6 +111,17 @@
         (= x 95)                                ; _
         (> x 127))))                            ; postgres allows non-ascii here
 
+(defn- token-start?
+  "True when `i` begins a token rather than continuing an identifier. Postgres
+  allows $ inside an identifier after the first character, so a$b$c is one name
+  and not a dollar quote opening, and E only introduces an escape string when it
+  stands alone rather than ending a word like date'2020-01-01'. Its own lexer
+  draws the line in the same place."
+  [sql i]
+  (or (zero? i)
+      (let [p (nth sql (dec i))]
+        (not (or (ident-char? p) (= p \$))))))
+
 (defn- skip-quoted
   "Index just past the run of quote character `q` opening at `i`. A doubled quote
   is an escaped one; `escapes?` additionally honours backslash escapes, which is
@@ -185,14 +196,14 @@
             (= c \") (recur (skip-quoted sql len i \" false) from pnum pieces)
 
             ;; E'...' / e'...', where a backslash escapes the next character
-            (and (or (= c \E) (= c \e)) (= nxt \'))
+            (and (or (= c \E) (= c \e)) (= nxt \') (token-start? sql i))
             (recur (skip-quoted sql len (inc i) \' true) from pnum pieces)
 
             (and (= c \-) (= nxt \-)) (recur (skip-line-comment sql len i) from pnum pieces)
             (and (= c \/) (= nxt \*)) (recur (skip-block-comment sql len i) from pnum pieces)
 
             (= c \$)
-            (if-let [taglen (dollar-tag-len sql len i)]
+            (if-let [taglen (and (token-start? sql i) (dollar-tag-len sql len i))]
               (recur (skip-dollar-quoted sql len i taglen) from pnum pieces)
               (recur (inc i) from pnum pieces))
 

@@ -42,23 +42,13 @@
 
 (defn close [conn] (PQfinish conn) nil)
 
-;; --- bytea ↔ byte-array ------------------------------------------------------
-;; PQexecParams runs in text mode here (NULL paramFormats, result format 0), so
-;; bytea crosses the wire as text in both directions. Outbound a byte-array
-;; becomes a hex literal, which postgres has parsed for bytea input since 9.0.
-;; Inbound the encoding is the server's bytea_output: hex since 9.0, escape on
-;; older servers or where it's been set back, so decode handles both. Either way
-;; the text is pure ASCII (escape output octal-escapes everything outside
-;; printable ASCII), so latin1 recovers the bytes libpq gave us byte for byte.
-
-(def ^:private hex-digits ["0" "1" "2" "3" "4" "5" "6" "7" "8" "9" "a" "b" "c" "d" "e" "f"])
-
-(defn- bytes->hex-literal [arr]
-  (str "\\x" (apply str (map (fn [b]
-                               (let [v (bit-and b 0xff)]
-                                 (str (nth hex-digits (bit-shift-right v 4))
-                                      (nth hex-digits (bit-and v 0xf)))))
-                             arr))))
+;; --- bytea → byte-array ------------------------------------------------------
+;; Results are still requested in text format (PQexecParams resultFormat 0), so a
+;; bytea column arrives as text in whichever encoding bytea_output names: hex
+;; since 9.0, escape on older servers or where it has been set back, so decode
+;; handles both. Either encoding is pure ASCII (escape output octal-escapes
+;; everything outside printable ASCII), so latin1 recovers the bytes libpq gave
+;; us byte for byte. Parameters go the other way in binary, see param-arrays.
 
 (defn- hex-nibble [b]
   (cond (and (>= b 48) (<= b 57))  (- b 48)     ; 0-9
@@ -98,26 +88,63 @@
       (hex->bytes src 2)
       (escape->bytes src))))
 
-;; build a char** of the params' text representations (NULL for a nil param,
-;; a hex literal for a byte-array); returns [arr-ptr str-ptrs] to free after
-;; the call.
-(defn- param-array [params]
-  (let [n (count params)
-        ps (ffi/sizeof :pointer)
-        arr (if (zero? n) ffi/null (ffi/alloc (* n ps)))
-        strs (mapv (fn [v] (cond
-                             (nil? v)   ffi/null
-                             (bytes? v) (ffi/string->ptr (bytes->hex-literal v))
-                             :else      (ffi/string->ptr (str v))))
-                   params)]
-    (dotimes [i n] (ffi/write arr :pointer (* i ps) (nth strs i)))
-    [arr strs]))
+;; --- parameters --------------------------------------------------------------
+;; PQexecParams takes four parallel per-parameter arrays: types (Oids), values,
+;; lengths, and formats. Everything goes over as text with its type left for
+;; postgres to infer, which is what the server does with a plain query anyway.
+;;
+;; A byte array is the exception: it goes over in binary with its Oid stated
+;; outright as bytea. Stating the type is the point. It means the parameter
+;; carries its own type instead of leaning on the statement to supply a bytea
+;; column to infer one from, so `select ?` binds a bytea rather than inferring
+;; text and handing back the literal the driver sent. Binary also skips the hex
+;; encode on the way out, so a large value crosses once as bytes instead of twice
+;; the size in ASCII.
+(def ^:private INFER-OID 0)              ; 0 = let postgres infer this parameter
+(def ^:private TEXT-FORMAT 0)
+(def ^:private BINARY-FORMAT 1)
+
+(defn- param-arrays
+  "Build PQexecParams' type / value / length / format arrays for `params`.
+  Returns [types values lengths formats owned], where owned is every pointer the
+  caller must free once the call has returned."
+  [params]
+  (let [n (count params)]
+    (if (zero? n)
+      [ffi/null ffi/null ffi/null ffi/null []]
+      (let [ps (ffi/sizeof :pointer)
+            is (ffi/sizeof :int)
+            os (ffi/sizeof :uint)
+            types   (ffi/alloc (* n os))
+            values  (ffi/alloc (* n ps))
+            lengths (ffi/alloc (* n is))
+            formats (ffi/alloc (* n is))
+            ;; a NULL value pointer is how libpq reads a SQL NULL, so an empty
+            ;; byte array still needs a pointer of its own to stay distinct from
+            ;; nil — hence the 1-byte floor on a 0-length payload.
+            cells (mapv (fn [v]
+                          (cond
+                            (nil? v)   [INFER-OID ffi/null 0 TEXT-FORMAT]
+                            (bytes? v) (let [len (alength v)
+                                             p (ffi/alloc (max 1 len))]
+                                         (ffi/write-array p v)
+                                         [bytea-oid p len BINARY-FORMAT])
+                            :else      [INFER-OID (ffi/string->ptr (str v)) 0 TEXT-FORMAT]))
+                        params)]
+        (dotimes [i n]
+          (let [[oid p len fmt] (nth cells i)]
+            (ffi/write types   :uint    (* i os) oid)
+            (ffi/write values  :pointer (* i ps) p)
+            (ffi/write lengths :int     (* i is) len)
+            (ffi/write formats :int     (* i is) fmt)))
+        [types values lengths formats
+         (into [types values lengths formats]
+               (remove (fn [p] (ffi/null? p)) (mapv second cells)))]))))
 
 (defn- run [conn sql params]
-  (let [[arr strs] (param-array params)
-        res (PQexecParams conn sql (count params) ffi/null arr ffi/null ffi/null 0)]
-    (doseq [p strs] (when-not (ffi/null? p) (ffi/free p)))
-    (when-not (ffi/null? arr) (ffi/free arr))
+  (let [[types values lengths formats owned] (param-arrays params)
+        res (PQexecParams conn sql (count params) types values lengths formats 0)]
+    (doseq [p owned] (ffi/free p))
     (let [st (PQresultStatus res)]
       (when-not (or (= st PGRES-COMMAND-OK) (= st PGRES-TUPLES-OK))
         (let [msg (PQresultErrorMessage res)] (PQclear res)

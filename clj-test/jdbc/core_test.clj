@@ -135,6 +135,42 @@
             (check (str "pg bytea/" mode " " label " returns bytes") true (bytes? actual))
             (check (str "pg bytea/" mode " " label " round-trips") (vec payload) (vec actual)))))
       (jdbc/execute! conn "reset bytea_output")
+      ;; A bytea parameter carries its own type, so it does not depend on there
+      ;; being a bytea column in the statement for postgres to infer from. Without
+      ;; that, `select ?` infers text and the parameter comes back as the literal
+      ;; string the driver sent rather than as bytes.
+      (let [payload (byte-array [65 0 -1 92 66])]
+        (check "pg bytea param needs no column to infer its type from"
+               (vec payload)
+               (vec (:c (jdbc/fetch-one conn ["select ? as c" payload]))))
+        (check "pg bytea param is bytes with nothing to infer from"
+               true
+               (bytes? (:c (jdbc/fetch-one conn ["select ? as c" payload]))))
+        (check "pg bytea param compares against a stored value" 1
+               (do (jdbc/execute! conn "delete from jolt_payload")
+                   (jdbc/insert! conn :jolt_payload {:content payload})
+                   (count (jdbc/fetch conn ["select id from jolt_payload where content = ?" payload]))))
+        (check "pg bytea param round-trips through a cast" (vec payload)
+               (vec (:c (jdbc/fetch-one conn ["select cast(? as bytea) as c" payload]))))
+        ;; the per-parameter type / length / format arrays have to stay aligned
+        ;; with the values array, so mix a bytea in among text parameters
+        (let [r (jdbc/fetch-one conn ["select ? as a, ? as b, ? as d" "before" payload "after"])]
+          (check "pg mixed text and bytea params keep their positions"
+                 ["before" (vec payload) "after"]
+                 [(:a r) (vec (:b r)) (:d r)]))
+        (check "pg empty bytea param survives with nothing to infer from" []
+               (vec (:c (jdbc/fetch-one conn ["select ? as c" (byte-array [])]))))
+        (check "pg nil param is still SQL NULL" nil
+               (:c (jdbc/fetch-one conn ["select ? as c" nil])))
+        (check "pg text param is unaffected" "plain"
+               (:c (jdbc/fetch-one conn ["select ? as c" "plain"])))
+        ;; a size the old hex literal would have sent as twice as many bytes, and
+        ;; enough of them to catch a binary bind that only walks part of the array
+        (let [big (byte-array (mapv (fn [i] (let [v (mod (* i 7) 256)]
+                                              (if (> v 127) (- v 256) v)))
+                                    (range 65536)))]
+          (check "pg 64KB bytea param round-trips" (vec big)
+                 (vec (:c (jdbc/fetch-one conn ["select ? as c" big]))))))
       (jdbc/execute! conn "drop table jolt_payload")
       (jdbc/execute! conn "drop table jolt_person")))
 

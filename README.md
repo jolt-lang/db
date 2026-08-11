@@ -32,6 +32,11 @@ non-UTF-8 bytes, and empty payloads all survive.
 (:body (jdbc/fetch-one conn "select body from doc"))   ; -> byte array
 ```
 
+On postgres a byte array is sent in binary with its type given as `bytea`, so it
+does not depend on the statement offering a `bytea` column for the server to infer
+one from. `["select ? as c" (byte-array [1 2])]` binds a `bytea` and reads back as
+bytes rather than inferring text.
+
 ## Errors
 
 Database errors are `ex-info` values carrying `:jdbc/sql-error true` in their

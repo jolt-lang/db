@@ -3,7 +3,8 @@
   the surface jdbc.core needs: connect / close / exec / all (rows as keyword-keyed
   maps, numeric columns coerced to jolt numbers). Loaded lazily by jdbc.core, so a
   sqlite-only app never needs libpq present."
-  (:require [jolt.ffi :as ffi]))
+  (:require [jolt.ffi :as ffi]
+            [clojure.string :as str]))
 
 ;; libpq is declared in deps.edn (:jolt/native, :optional) and loaded by jolt at
 ;; startup when present; jdbc.core only requires this namespace for a postgres
@@ -89,6 +90,128 @@
       (hex->bytes src 2)
       (escape->bytes src))))
 
+;;; ? -> $N rewriting
+;;
+;; Which ? counts as a placeholder decides which parameter lands where, so a ?
+;; that only looks like one has to be skipped without consuming a number. That
+;; means recognising the constructs a ? can hide in: string literals, quoted
+;; identifiers, line and block comments, dollar-quoted bodies, and E'' escape
+;; strings. Each is skipped whole by the scanner below.
+
+(defn- at
+  "The character at `i`, or nil past the end, so callers can compare without
+  bounds-checking first."
+  [sql len i]
+  (when (< i len) (nth sql i)))
+
+(defn- digit? [c] (let [x (int c)] (and (>= x 48) (<= x 57))))
+
+(defn- ident-char? [c]
+  (let [x (int c)]
+    (or (and (>= x 97) (<= x 122))              ; a-z
+        (and (>= x 65) (<= x 90))               ; A-Z
+        (and (>= x 48) (<= x 57))               ; 0-9
+        (= x 95)                                ; _
+        (> x 127))))                            ; postgres allows non-ascii here
+
+(defn- token-start?
+  "True when `i` begins a token rather than continuing an identifier. Postgres
+  allows $ inside an identifier after the first character, so a$b$c is one name
+  and not a dollar quote opening, and E only introduces an escape string when it
+  stands alone rather than ending a word like date'2020-01-01'. Its own lexer
+  draws the line in the same place."
+  [sql i]
+  (or (zero? i)
+      (let [p (nth sql (dec i))]
+        (not (or (ident-char? p) (= p \$))))))
+
+(defn- skip-quoted
+  "Index just past the run of quote character `q` opening at `i`. A doubled quote
+  is an escaped one; `escapes?` additionally honours backslash escapes, which is
+  what distinguishes E'...' from a plain literal. An unterminated run ends at the
+  end of the statement rather than throwing."
+  [sql len i q escapes?]
+  (loop [j (inc i)]
+    (cond
+      (>= j len)                        len
+      (and escapes? (= (nth sql j) \\)) (recur (+ j 2))
+      (not= (nth sql j) q)              (recur (inc j))
+      (= (at sql len (inc j)) q)        (recur (+ j 2))
+      :else                             (inc j))))
+
+(defn- skip-line-comment [sql len i]
+  (loop [j (+ i 2)]
+    (cond (>= j len)                 len
+          (= (nth sql j) \newline)   j
+          :else                      (recur (inc j)))))
+
+(defn- skip-block-comment
+  "Index just past the /* */ comment opening at `i`. Postgres nests these, so
+  track depth rather than stopping at the first */."
+  [sql len i]
+  (loop [j (+ i 2) depth 1]
+    (cond
+      (>= j len) len
+      (and (= (nth sql j) \/) (= (at sql len (inc j)) \*)) (recur (+ j 2) (inc depth))
+      (and (= (nth sql j) \*) (= (at sql len (inc j)) \/)) (if (= depth 1)
+                                                             (+ j 2)
+                                                             (recur (+ j 2) (dec depth)))
+      :else (recur (inc j) depth))))
+
+(defn- dollar-tag-len
+  "Length of the $tag$ that opens at `i`, or nil when this $ does not open a
+  dollar quote. The tag follows unquoted-identifier rules, so it cannot start
+  with a digit, which is what keeps a positional $1 from being read as one."
+  [sql len i]
+  (loop [j (inc i)]
+    (let [c (at sql len j)]
+      (cond
+        (nil? c)                        nil
+        (= c \$)                        (- (inc j) i)
+        (and (= j (inc i)) (digit? c))  nil
+        (ident-char? c)                 (recur (inc j))
+        :else                           nil))))
+
+(defn- skip-dollar-quoted [sql len i taglen]
+  (let [tag (subs sql i (+ i taglen))]
+    (if-let [close (str/index-of sql tag (+ i taglen))]
+      (+ close taglen)
+      len)))
+
+(defn pg-placeholders
+  "JDBC ? placeholders -> postgres $1..$N. A ? inside a string literal, quoted
+  identifier, comment, dollar-quoted body or escape string is left as it is and
+  does not consume a number. Collects the pieces and joins them once, so the cost
+  is linear in the length of the statement."
+  [sql]
+  (let [len (count sql)]
+    (loop [i 0 from 0 pnum 1 pieces (transient [])]
+      (if (>= i len)
+        (str/join (persistent! (conj! pieces (subs sql from len))))
+        (let [c (nth sql i)
+              nxt (at sql len (inc i))]
+          (cond
+            (= c \?)
+            (recur (inc i) (inc i) (inc pnum)
+                   (conj! (conj! pieces (subs sql from i)) (str "$" pnum)))
+
+            (= c \') (recur (skip-quoted sql len i \' false) from pnum pieces)
+            (= c \") (recur (skip-quoted sql len i \" false) from pnum pieces)
+
+            ;; E'...' / e'...', where a backslash escapes the next character
+            (and (or (= c \E) (= c \e)) (= nxt \') (token-start? sql i))
+            (recur (skip-quoted sql len (inc i) \' true) from pnum pieces)
+
+            (and (= c \-) (= nxt \-)) (recur (skip-line-comment sql len i) from pnum pieces)
+            (and (= c \/) (= nxt \*)) (recur (skip-block-comment sql len i) from pnum pieces)
+
+            (= c \$)
+            (if-let [taglen (and (token-start? sql i) (dollar-tag-len sql len i))]
+              (recur (skip-dollar-quoted sql len i taglen) from pnum pieces)
+              (recur (inc i) from pnum pieces))
+
+            :else (recur (inc i) from pnum pieces)))))))
+
 ;; --- parameters --------------------------------------------------------------
 ;; PQexecParams takes four parallel per-parameter arrays: types (Oids), values,
 ;; lengths, and formats. Everything goes over as text with its type left for
@@ -144,7 +267,9 @@
 
 (defn- run [conn sql params]
   (let [[types values lengths formats owned] (param-arrays params)
-        res (PQexecParams conn sql (count params) types values lengths formats 0)]
+        ;; callers write JDBC ? placeholders; postgres wants $1..$N
+        res (PQexecParams conn (pg-placeholders sql) (count params)
+                          types values lengths formats 0)]
     (doseq [p owned] (ffi/free p))
     (let [st (PQresultStatus res)]
       (when-not (or (= st PGRES-COMMAND-OK) (= st PGRES-TUPLES-OK))
@@ -170,16 +295,26 @@
         (= bytea-oid oid) (bytea->bytes s)
         :else             s))
 
-(defn all [conn sql params]
+(defn all-raw
+  "Run `sql` and return {:labels [col-name ...] :rows [[v ...]]}, keeping column
+  order for a caller that reads a row by index. `all` is this with the rows turned
+  into maps."
+  [conn sql params]
   (let [res (run conn sql params)
         nrows (PQntuples res)
         ncols (PQnfields res)
-        cols (mapv (fn [c] [(keyword (PQfname res c)) (PQftype res c)]) (range ncols))
+        labels (mapv (fn [c] (PQfname res c)) (range ncols))
+        oids (mapv (fn [c] (PQftype res c)) (range ncols))
         rows (mapv (fn [r]
-                     (reduce (fn [m c]
-                               (let [[k oid] (nth cols c)]
-                                 (assoc m k (if (zero? (PQgetisnull res r c)) (coerce oid (PQgetvalue res r c)) nil))))
-                             {} (range ncols)))
+                     (mapv (fn [c]
+                             (when (zero? (PQgetisnull res r c))
+                               (coerce (nth oids c) (PQgetvalue res r c))))
+                           (range ncols)))
                    (range nrows))]
     (PQclear res)
-    rows))
+    {:labels labels :rows rows}))
+
+(defn all [conn sql params]
+  (let [{:keys [labels rows]} (all-raw conn sql params)
+        ks (mapv keyword labels)]
+    (mapv (fn [vs] (zipmap ks vs)) rows)))

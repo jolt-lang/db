@@ -74,24 +74,24 @@
           :else                          (sqlite3-bind-text stmt i (str v) -1 SQLITE-TRANSIENT)))
       (recur (inc i) (next ps)))))
 
-(defn- read-row [stmt n]
-  (loop [i 0 m {}]
-    (if (= i n)
-      m
-      (let [k (keyword (sqlite3-column-name stmt i))
-            ty (sqlite3-column-type stmt i)
-            v (cond
-                (= ty TY-INT)   (sqlite3-column-int64 stmt i)
-                (= ty TY-FLOAT) (sqlite3-column-double stmt i)
-                (= ty TY-BLOB)  (let [n (sqlite3-column-bytes stmt i)]
-                                  (ffi/read-array (sqlite3-column-blob stmt i) n))
-                (= ty TY-NULL)  nil
-                :else           (sqlite3-column-text stmt i))]
-        (recur (inc i) (assoc m k v))))))
+(defn- read-value [stmt i]
+  (let [ty (sqlite3-column-type stmt i)]
+    (cond
+      (= ty TY-INT)   (sqlite3-column-int64 stmt i)
+      (= ty TY-FLOAT) (sqlite3-column-double stmt i)
+      (= ty TY-BLOB)  (let [n (sqlite3-column-bytes stmt i)]
+                        (ffi/read-array (sqlite3-column-blob stmt i) n))
+      (= ty TY-NULL)  nil
+      :else           (sqlite3-column-text stmt i))))
 
-(defn query
-  "Run `sql` with `params` (a seq); return a vector of keyword-keyed row maps
-  (empty for a non-SELECT)."
+(defn- read-values [stmt n]
+  (loop [i 0 acc (transient [])]
+    (if (= i n) (persistent! acc) (recur (inc i) (conj! acc (read-value stmt i))))))
+
+(defn query-raw
+  "Run `sql` with `params` (a seq); return {:labels [col-name ...] :rows [[v ...]]}.
+  Column order is preserved, which a JDBC-shaped caller needs to read a row by
+  index. `query` is this with the rows turned into maps."
   [db sql params]
   (let [pp (ffi/alloc (ffi/sizeof :pointer))
         rc (sqlite3-prepare db sql -1 pp ffi/null)
@@ -101,16 +101,26 @@
       (throw (ex-info (str "sqlite prepare failed: " (sqlite3-errmsg db) " — " sql)
                       {:jdbc/sql-error true})))
     (bind-params! stmt params)
-    (let [ncol (sqlite3-column-count stmt)]
+    (let [ncol (sqlite3-column-count stmt)
+          labels (mapv (fn [i] (sqlite3-column-name stmt i)) (range ncol))]
       (loop [rows (transient [])]
         (let [r (sqlite3-step stmt)]
           (cond
-            (= r SQLITE-ROW)  (recur (conj! rows (read-row stmt ncol)))
-            (= r SQLITE-DONE) (do (sqlite3-finalize stmt) (persistent! rows))
+            (= r SQLITE-ROW)  (recur (conj! rows (read-values stmt ncol)))
+            (= r SQLITE-DONE) (do (sqlite3-finalize stmt)
+                                  {:labels labels :rows (persistent! rows)})
             :else (let [msg (sqlite3-errmsg db)]
                     (sqlite3-finalize stmt)
                     (throw (ex-info (str "sqlite step failed: " msg)
                                     {:rc r :jdbc/sql-error true})))))))))
+
+(defn query
+  "Run `sql` with `params` (a seq); return a vector of keyword-keyed row maps
+  (empty for a non-SELECT)."
+  [db sql params]
+  (let [{:keys [labels rows]} (query-raw db sql params)
+        ks (mapv keyword labels)]
+    (mapv (fn [vs] (zipmap ks vs)) rows)))
 
 (defn changes [db] (sqlite3-changes db))
 (defn last-insert-rowid [db] (sqlite3-last-rowid db))

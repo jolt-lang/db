@@ -1,5 +1,9 @@
 (ns jdbc.core-test
-  (:require [jdbc.core :as jdbc]))
+  (:require [jdbc.core :as jdbc]
+            ;; the placeholder rewriter lives in the pg driver; requiring it here
+            ;; lets the sqlite-only run cover the lexer table. Loading db.pg does
+            ;; not need libpq present, only calling into it does.
+            [db.pg]))
 
 (def failures (atom 0))
 
@@ -87,7 +91,7 @@
   ;; really a placeholder must neither be rewritten nor consume a number. These
   ;; run without a database, so the sqlite-only build covers them.
   (println "postgres placeholder rewriting")
-  (let [rewrite (deref (resolve (symbol "jdbc.core" "pg-placeholders")))]
+  (let [rewrite (deref (resolve (symbol "db.pg" "pg-placeholders")))]
     (doseq [[label in out]
             [["no placeholders"        "select 1"                    "select 1"]
              ["bare placeholder"       "?"                           "$1"]

@@ -87,128 +87,6 @@
     (vector? q) [(first q) (vec (rest q))]
     :else (throw (ex-info "query must be a string or sqlvec" {:q q}))))
 
-;;; ? -> $N rewriting
-;;
-;; Which ? counts as a placeholder decides which parameter lands where, so a ?
-;; that only looks like one has to be skipped without consuming a number. That
-;; means recognising the constructs a ? can hide in: string literals, quoted
-;; identifiers, line and block comments, dollar-quoted bodies, and E'' escape
-;; strings. Each is skipped whole by the scanner below.
-
-(defn- at
-  "The character at `i`, or nil past the end, so callers can compare without
-  bounds-checking first."
-  [sql len i]
-  (when (< i len) (nth sql i)))
-
-(defn- digit? [c] (let [x (int c)] (and (>= x 48) (<= x 57))))
-
-(defn- ident-char? [c]
-  (let [x (int c)]
-    (or (and (>= x 97) (<= x 122))              ; a-z
-        (and (>= x 65) (<= x 90))               ; A-Z
-        (and (>= x 48) (<= x 57))               ; 0-9
-        (= x 95)                                ; _
-        (> x 127))))                            ; postgres allows non-ascii here
-
-(defn- token-start?
-  "True when `i` begins a token rather than continuing an identifier. Postgres
-  allows $ inside an identifier after the first character, so a$b$c is one name
-  and not a dollar quote opening, and E only introduces an escape string when it
-  stands alone rather than ending a word like date'2020-01-01'. Its own lexer
-  draws the line in the same place."
-  [sql i]
-  (or (zero? i)
-      (let [p (nth sql (dec i))]
-        (not (or (ident-char? p) (= p \$))))))
-
-(defn- skip-quoted
-  "Index just past the run of quote character `q` opening at `i`. A doubled quote
-  is an escaped one; `escapes?` additionally honours backslash escapes, which is
-  what distinguishes E'...' from a plain literal. An unterminated run ends at the
-  end of the statement rather than throwing."
-  [sql len i q escapes?]
-  (loop [j (inc i)]
-    (cond
-      (>= j len)                        len
-      (and escapes? (= (nth sql j) \\)) (recur (+ j 2))
-      (not= (nth sql j) q)              (recur (inc j))
-      (= (at sql len (inc j)) q)        (recur (+ j 2))
-      :else                             (inc j))))
-
-(defn- skip-line-comment [sql len i]
-  (loop [j (+ i 2)]
-    (cond (>= j len)                 len
-          (= (nth sql j) \newline)   j
-          :else                      (recur (inc j)))))
-
-(defn- skip-block-comment
-  "Index just past the /* */ comment opening at `i`. Postgres nests these, so
-  track depth rather than stopping at the first */."
-  [sql len i]
-  (loop [j (+ i 2) depth 1]
-    (cond
-      (>= j len) len
-      (and (= (nth sql j) \/) (= (at sql len (inc j)) \*)) (recur (+ j 2) (inc depth))
-      (and (= (nth sql j) \*) (= (at sql len (inc j)) \/)) (if (= depth 1)
-                                                             (+ j 2)
-                                                             (recur (+ j 2) (dec depth)))
-      :else (recur (inc j) depth))))
-
-(defn- dollar-tag-len
-  "Length of the $tag$ that opens at `i`, or nil when this $ does not open a
-  dollar quote. The tag follows unquoted-identifier rules, so it cannot start
-  with a digit, which is what keeps a positional $1 from being read as one."
-  [sql len i]
-  (loop [j (inc i)]
-    (let [c (at sql len j)]
-      (cond
-        (nil? c)                        nil
-        (= c \$)                        (- (inc j) i)
-        (and (= j (inc i)) (digit? c))  nil
-        (ident-char? c)                 (recur (inc j))
-        :else                           nil))))
-
-(defn- skip-dollar-quoted [sql len i taglen]
-  (let [tag (subs sql i (+ i taglen))]
-    (if-let [close (str/index-of sql tag (+ i taglen))]
-      (+ close taglen)
-      len)))
-
-(defn- pg-placeholders
-  "JDBC ? placeholders -> postgres $1..$N. A ? inside a string literal, quoted
-  identifier, comment, dollar-quoted body or escape string is left as it is and
-  does not consume a number. Collects the pieces and joins them once, so the cost
-  is linear in the length of the statement."
-  [sql]
-  (let [len (count sql)]
-    (loop [i 0 from 0 pnum 1 pieces (transient [])]
-      (if (>= i len)
-        (str/join (persistent! (conj! pieces (subs sql from len))))
-        (let [c (nth sql i)
-              nxt (at sql len (inc i))]
-          (cond
-            (= c \?)
-            (recur (inc i) (inc i) (inc pnum)
-                   (conj! (conj! pieces (subs sql from i)) (str "$" pnum)))
-
-            (= c \') (recur (skip-quoted sql len i \' false) from pnum pieces)
-            (= c \") (recur (skip-quoted sql len i \" false) from pnum pieces)
-
-            ;; E'...' / e'...', where a backslash escapes the next character
-            (and (or (= c \E) (= c \e)) (= nxt \') (token-start? sql i))
-            (recur (skip-quoted sql len (inc i) \' true) from pnum pieces)
-
-            (and (= c \-) (= nxt \-)) (recur (skip-line-comment sql len i) from pnum pieces)
-            (and (= c \/) (= nxt \*)) (recur (skip-block-comment sql len i) from pnum pieces)
-
-            (= c \$)
-            (if-let [taglen (and (token-start? sql i) (dollar-tag-len sql len i))]
-              (recur (skip-dollar-quoted sql len i taglen) from pnum pieces)
-              (recur (inc i) from pnum pieces))
-
-            :else (recur (inc i) from pnum pieces)))))))
-
 (defn- sqlite-eval [conn sql params]
   (sqlite/query (:handle conn) sql params))
 
@@ -217,7 +95,7 @@
 (defn- pgfn [n] (deref (resolve (symbol "db.pg" n))))
 
 (defn- pg-eval [conn sql params]
-  ((pgfn "exec") (:handle conn) (pg-placeholders sql) params))
+  ((pgfn "exec") (:handle conn) sql params))
 
 (defn fetch
   "Run a query (string or sqlvec), return a vector of keyword-keyed row maps."
@@ -226,7 +104,7 @@
    (let [[sql params] (sqlvec q)
          rows (case (:vendor conn)
                 :sqlite     (sqlite-eval conn sql params)
-                :postgresql ((pgfn "all") (:handle conn) (pg-placeholders sql) params))]
+                :postgresql ((pgfn "all") (:handle conn) sql params))]
      (if-let [n (:max-rows opts)] (vec (take n rows)) rows))))
 
 (defn fetch-one

@@ -83,6 +83,45 @@
            (jdbc/execute! c "create table t (x integer)")
            (jdbc/insert! c :t {:x 7})))
 
+  ;; Rewriting ? to $N decides which parameter goes where, so a ? that is not
+  ;; really a placeholder must neither be rewritten nor consume a number. These
+  ;; run without a database, so the sqlite-only build covers them.
+  (println "postgres placeholder rewriting")
+  (let [rewrite (deref (resolve (symbol "jdbc.core" "pg-placeholders")))]
+    (doseq [[label in out]
+            [["no placeholders"        "select 1"                    "select 1"]
+             ["bare placeholder"       "?"                           "$1"]
+             ["several"                "? ? ?"                       "$1 $2 $3"]
+             ["two digits"             "? ? ? ? ? ? ? ? ? ? ?"       "$1 $2 $3 $4 $5 $6 $7 $8 $9 $10 $11"]
+             ["string literal"         "select '?' as a, ? as b"     "select '?' as a, $1 as b"]
+             ["doubled quote escape"   "select 'it''s ?' , ?"        "select 'it''s ?' , $1"]
+             ["quoted identifier"      "select \"c?\" from t where x = ?"
+                                       "select \"c?\" from t where x = $1"]
+             ["doubled double quote"   "select \"a\"\"?\" , ?"       "select \"a\"\"?\" , $1"]
+             ["line comment"           "select ? -- is this right?\n, ?"
+                                       "select $1 -- is this right?\n, $2"]
+             ["block comment"          "select /* ? */ ? as c"       "select /* ? */ $1 as c"]
+             ["nested block comment"   "select /* a /* ? */ ? */ ? as c"
+                                       "select /* a /* ? */ ? */ $1 as c"]
+             ["dollar quoted"          "select $$a?b$$ , ?"          "select $$a?b$$ , $1"]
+             ["dollar quoted with tag" "select $tag$ ? $tag$, ?"     "select $tag$ ? $tag$, $1"]
+             ["escape string"          "select E'\\'?' , ?"          "select E'\\'?' , $1"]
+             ["unterminated literal"   "select '?"                   "select '?"]
+             ["unterminated comment"   "select /* ?"                 "select /* ?"]]]
+      (check (str "placeholders, " label) out (rewrite in)))
+    ;; Rebuilding the statement one character at a time made this quadratic: 40KB
+    ;; of SQL already cost 129ms of pure string copying before the query was sent.
+    ;; The bound is loose enough not to be flaky and still far under what
+    ;; quadratic would need for half a megabyte.
+    (let [big (str "select ? /* " (apply str (repeat 500000 "x")) " */")
+          t0 (System/currentTimeMillis)
+          got (rewrite big)
+          ms (- (System/currentTimeMillis) t0)]
+      (check "placeholders, half a megabyte of sql rewrites correctly" true
+             (and (clojure.string/starts-with? got "select $1 /* ")
+                  (= (count got) (inc (count big)))))
+      (check (str "placeholders, half a megabyte stays linear (" ms " ms)") true (< ms 5000))))
+
   (when-let [pg-uri (System/getenv "JOLT_TEST_PG_URI")]
     (println "jdbc.core over postgres (" pg-uri ")")
     (with-open [conn (jdbc/connection pg-uri)]
@@ -114,6 +153,24 @@
              (try
                (jdbc/fetch conn "select * from jolt_missing_table")
                (catch Exception _ :caught)))
+      ;; execute! promises rows affected, and sqlite delivers it; postgres used to
+      ;; return nil from all three of these
+      (check "pg execute! returns rows affected" 1
+             (jdbc/execute! conn ["insert into jolt_person (name, zip) values (?, ?)" "rows" 7]))
+      (check "pg update! returns rows affected" 1
+             (jdbc/update! conn :jolt_person {:zip 8} ["name = ?" "rows"]))
+      (check "pg delete! returns rows affected" 1
+             (jdbc/delete! conn :jolt_person ["name = ?" "rows"]))
+      (check "pg execute! returns 0 affected for ddl" 0
+             (jdbc/execute! conn "create table jolt_counts (x integer)"))
+      (check "pg execute! counts a multi-row update" 2
+             (do (jdbc/insert-multi! conn :jolt_counts [{:x 1} {:x 1} {:x 2}])
+                 (jdbc/update! conn :jolt_counts {:x 9} ["x = ?" 1])))
+      (jdbc/execute! conn "drop table jolt_counts")
+      (check "pg ? inside a comment does not consume a parameter" "v"
+             (:c (jdbc/fetch-one conn ["select /* ? */ ? as c" "v"])))
+      (check "pg ? inside a quoted identifier is left alone" "v"
+             (:c (jdbc/fetch-one conn ["select ? as \"c\" /* ? */" "v"])))
       (jdbc/execute! conn "drop table if exists jolt_payload")
       (jdbc/execute! conn "create table jolt_payload (id serial primary key, content bytea not null)")
       ;; bytea reads back as text, in whichever format bytea_output names, so run

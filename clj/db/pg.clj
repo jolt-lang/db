@@ -16,6 +16,7 @@
 (ffi/defcfn PQexecParams       "PQexecParams"       [:pointer :string :int :pointer :pointer :pointer :pointer :int] :pointer)
 (ffi/defcfn PQresultStatus     "PQresultStatus"     [:pointer] :int)
 (ffi/defcfn PQresultErrorMessage "PQresultErrorMessage" [:pointer] :string)
+(ffi/defcfn PQcmdTuples         "PQcmdTuples"         [:pointer] :string)
 (ffi/defcfn PQntuples          "PQntuples"          [:pointer] :int)
 (ffi/defcfn PQnfields          "PQnfields"          [:pointer] :int)
 (ffi/defcfn PQfname            "PQfname"            [:pointer :int] :string)
@@ -152,7 +153,15 @@
                           {:sql sql :jdbc/sql-error true}))))
       res)))
 
-(defn exec [conn sql params] (PQclear (run conn sql params)) nil)
+(defn exec
+  "Run a statement and return the number of rows it affected. Commands that do not
+  report a count, DDL among them, give 0 — which is what sqlite3_changes reports
+  for those too."
+  [conn sql params]
+  (let [res (run conn sql params)
+        n (PQcmdTuples res)]                     ; must be read before PQclear
+    (PQclear res)
+    (or (when n (parse-long n)) 0)))
 
 (defn- coerce [oid s]
   (cond (int-oids oid)    (parse-long s)

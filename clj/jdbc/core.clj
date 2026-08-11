@@ -87,17 +87,116 @@
     (vector? q) [(first q) (vec (rest q))]
     :else (throw (ex-info "query must be a string or sqlvec" {:q q}))))
 
+;;; ? -> $N rewriting
+;;
+;; Which ? counts as a placeholder decides which parameter lands where, so a ?
+;; that only looks like one has to be skipped without consuming a number. That
+;; means recognising the constructs a ? can hide in: string literals, quoted
+;; identifiers, line and block comments, dollar-quoted bodies, and E'' escape
+;; strings. Each is skipped whole by the scanner below.
+
+(defn- at
+  "The character at `i`, or nil past the end, so callers can compare without
+  bounds-checking first."
+  [sql len i]
+  (when (< i len) (nth sql i)))
+
+(defn- digit? [c] (let [x (int c)] (and (>= x 48) (<= x 57))))
+
+(defn- ident-char? [c]
+  (let [x (int c)]
+    (or (and (>= x 97) (<= x 122))              ; a-z
+        (and (>= x 65) (<= x 90))               ; A-Z
+        (and (>= x 48) (<= x 57))               ; 0-9
+        (= x 95)                                ; _
+        (> x 127))))                            ; postgres allows non-ascii here
+
+(defn- skip-quoted
+  "Index just past the run of quote character `q` opening at `i`. A doubled quote
+  is an escaped one; `escapes?` additionally honours backslash escapes, which is
+  what distinguishes E'...' from a plain literal. An unterminated run ends at the
+  end of the statement rather than throwing."
+  [sql len i q escapes?]
+  (loop [j (inc i)]
+    (cond
+      (>= j len)                        len
+      (and escapes? (= (nth sql j) \\)) (recur (+ j 2))
+      (not= (nth sql j) q)              (recur (inc j))
+      (= (at sql len (inc j)) q)        (recur (+ j 2))
+      :else                             (inc j))))
+
+(defn- skip-line-comment [sql len i]
+  (loop [j (+ i 2)]
+    (cond (>= j len)                 len
+          (= (nth sql j) \newline)   j
+          :else                      (recur (inc j)))))
+
+(defn- skip-block-comment
+  "Index just past the /* */ comment opening at `i`. Postgres nests these, so
+  track depth rather than stopping at the first */."
+  [sql len i]
+  (loop [j (+ i 2) depth 1]
+    (cond
+      (>= j len) len
+      (and (= (nth sql j) \/) (= (at sql len (inc j)) \*)) (recur (+ j 2) (inc depth))
+      (and (= (nth sql j) \*) (= (at sql len (inc j)) \/)) (if (= depth 1)
+                                                             (+ j 2)
+                                                             (recur (+ j 2) (dec depth)))
+      :else (recur (inc j) depth))))
+
+(defn- dollar-tag-len
+  "Length of the $tag$ that opens at `i`, or nil when this $ does not open a
+  dollar quote. The tag follows unquoted-identifier rules, so it cannot start
+  with a digit, which is what keeps a positional $1 from being read as one."
+  [sql len i]
+  (loop [j (inc i)]
+    (let [c (at sql len j)]
+      (cond
+        (nil? c)                        nil
+        (= c \$)                        (- (inc j) i)
+        (and (= j (inc i)) (digit? c))  nil
+        (ident-char? c)                 (recur (inc j))
+        :else                           nil))))
+
+(defn- skip-dollar-quoted [sql len i taglen]
+  (let [tag (subs sql i (+ i taglen))]
+    (if-let [close (str/index-of sql tag (+ i taglen))]
+      (+ close taglen)
+      len)))
+
 (defn- pg-placeholders
-  "JDBC ? placeholders -> postgres $1..$N (skipping ? inside '...' literals)."
+  "JDBC ? placeholders -> postgres $1..$N. A ? inside a string literal, quoted
+  identifier, comment, dollar-quoted body or escape string is left as it is and
+  does not consume a number. Collects the pieces and joins them once, so the cost
+  is linear in the length of the statement."
   [sql]
-  (loop [out "" i 0 n 1 in-str false]
-    (if (= i (count sql))
-      out
-      (let [c (subs sql i (inc i))]
-        (cond
-          (= c "'") (recur (str out c) (inc i) n (not in-str))
-          (and (= c "?") (not in-str)) (recur (str out "$" n) (inc i) (inc n) in-str)
-          :else (recur (str out c) (inc i) n in-str))))))
+  (let [len (count sql)]
+    (loop [i 0 from 0 pnum 1 pieces (transient [])]
+      (if (>= i len)
+        (str/join (persistent! (conj! pieces (subs sql from len))))
+        (let [c (nth sql i)
+              nxt (at sql len (inc i))]
+          (cond
+            (= c \?)
+            (recur (inc i) (inc i) (inc pnum)
+                   (conj! (conj! pieces (subs sql from i)) (str "$" pnum)))
+
+            (= c \') (recur (skip-quoted sql len i \' false) from pnum pieces)
+            (= c \") (recur (skip-quoted sql len i \" false) from pnum pieces)
+
+            ;; E'...' / e'...', where a backslash escapes the next character
+            (and (or (= c \E) (= c \e)) (= nxt \'))
+            (recur (skip-quoted sql len (inc i) \' true) from pnum pieces)
+
+            (and (= c \-) (= nxt \-)) (recur (skip-line-comment sql len i) from pnum pieces)
+            (and (= c \/) (= nxt \*)) (recur (skip-block-comment sql len i) from pnum pieces)
+
+            (= c \$)
+            (if-let [taglen (dollar-tag-len sql len i)]
+              (recur (skip-dollar-quoted sql len i taglen) from pnum pieces)
+              (recur (inc i) from pnum pieces))
+
+            :else (recur (inc i) from pnum pieces)))))))
 
 (defn- sqlite-eval [conn sql params]
   (sqlite/query (:handle conn) sql params))
@@ -132,10 +231,11 @@
      (case (:vendor conn)
        :sqlite     (do (sqlite-eval conn sql params)
                        (sqlite/changes (:handle conn)))
-       :postgresql (do (pg-eval conn sql params) nil)))))
+       :postgresql (pg-eval conn sql params)))))
 
 (defn last-insert-id
-  "Driver-specific id of the last inserted row (sqlite: last_insert_rowid)."
+  "Driver-specific id of the last inserted row (sqlite: last_insert_rowid,
+  postgres: lastval, which needs the session to have used a sequence)."
   [conn]
   (case (:vendor conn)
     :sqlite     (sqlite/last-insert-rowid (:handle conn))
@@ -146,8 +246,10 @@
 (defn- entity-str [entities x] (entities (if (keyword? x) (name x) (str x))))
 
 (defn insert!
-  "Insert one row map. Returns the generated id (sqlite) / nil (postgres —
-  use \"... returning *\" with execute!/fetch for the row)."
+  "Insert one row map and return the generated id, from last_insert_rowid on
+  sqlite and lastval on postgres. Inserting into a postgres table with no
+  sequence therefore throws, since lastval has nothing to report — use
+  \"... returning ...\" with execute!/fetch for that case."
   ([conn table row] (insert! conn table row {}))
   ([conn table row opts]
    (let [entities (get opts :entities identity)

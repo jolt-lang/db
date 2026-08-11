@@ -225,3 +225,11 @@
   (if (map? (first body))
     `(atomic-apply ~conn (fn [c#] (let [~conn c#] ~@(next body))) ~(first body))
     `(atomic-apply ~conn (fn [c#] (let [~conn c#] ~@body)))))
+
+;; SQL errors satisfy (catch java.sql.SQLException ...) — migratus's
+;; table-exists? probe and friends rely on that contract.
+(clojure.core/__register-instance-check!
+  (fn [cn val]
+    (if (= cn "java.sql.SQLException")
+      (boolean (:jdbc/sql-error (ex-data val)))
+      nil)))

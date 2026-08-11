@@ -45,7 +45,8 @@
       (let [rc (sqlite3-open path pp)
             db (ffi/read pp :pointer)]
         (when-not (= rc SQLITE-OK)
-          (throw (ex-info (str "sqlite open failed: " path) {:rc rc})))
+          (throw (ex-info (str "sqlite open failed: " path)
+                          {:rc rc :jdbc/sql-error true})))
         db)
       (finally (ffi/free pp)))))
 
@@ -85,7 +86,8 @@
         stmt (ffi/read pp :pointer)]
     (ffi/free pp)
     (when-not (= rc SQLITE-OK)
-      (throw (ex-info (str "sqlite prepare failed: " (sqlite3-errmsg db) " — " sql) {})))
+      (throw (ex-info (str "sqlite prepare failed: " (sqlite3-errmsg db) " — " sql)
+                      {:jdbc/sql-error true})))
     (bind-params! stmt params)
     (let [ncol (sqlite3-column-count stmt)]
       (loop [rows (transient [])]
@@ -95,7 +97,8 @@
             (= r SQLITE-DONE) (do (sqlite3-finalize stmt) (persistent! rows))
             :else (let [msg (sqlite3-errmsg db)]
                     (sqlite3-finalize stmt)
-                    (throw (ex-info (str "sqlite step failed: " msg) {:rc r})))))))))
+                    (throw (ex-info (str "sqlite step failed: " msg)
+                                    {:rc r :jdbc/sql-error true})))))))))
 
 (defn changes [db] (sqlite3-changes db))
 (defn last-insert-rowid [db] (sqlite3-last-rowid db))

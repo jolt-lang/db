@@ -24,6 +24,14 @@
            (jdbc/fetch-one conn ["select * from person where zip = ?" 10001]))
     (check "fetch plain string" 3
            (count (jdbc/fetch conn "select * from person")))
+    (check "SQL errors catch java.sql.SQLException" :caught
+           (try
+             (jdbc/fetch conn "select * from missing_table")
+             (catch java.sql.SQLException _ :caught)))
+    (check "SQL errors still catch Exception" :caught
+           (try
+             (jdbc/fetch conn "select * from missing_table")
+             (catch Exception _ :caught)))
     (check "update! rows affected" 2
            (jdbc/update! conn :person {:zip 94540} ["zip = ?" 94546]))
     (check "update applied" 2

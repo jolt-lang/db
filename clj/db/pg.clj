@@ -1,14 +1,17 @@
 (ns db.pg
   "PostgreSQL driver for jolt, binding the system libpq through jolt.ffi. Exposes
   the surface jdbc.core needs: connect / close / exec / all (rows as keyword-keyed
-  maps, numeric columns coerced to jolt numbers). Loaded lazily by jdbc.core, so a
-  sqlite-only app never needs libpq present."
+  maps, numeric columns coerced to jolt numbers). Required statically by its
+  callers; a sqlite-only app still never needs libpq present, because loading this
+  namespace only declares the bindings and libpq is not touched until one is
+  called."
   (:require [jolt.ffi :as ffi]
             [clojure.string :as str]))
 
 ;; libpq is declared in deps.edn (:jolt/native, :optional) and loaded by jolt at
-;; startup when present; jdbc.core only requires this namespace for a postgres
-;; connection, so a sqlite-only app never needs libpq.
+;; startup when present. Its absence is only a problem for a program that actually
+;; opens a postgres connection: ffi/defcfn resolves a symbol on first call, so this
+;; namespace loads either way.
 
 (ffi/defcfn PQconnectdb        "PQconnectdb"        [:string] :pointer)
 (ffi/defcfn PQstatus           "PQstatus"           [:pointer] :int)

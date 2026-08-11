@@ -15,7 +15,8 @@
   implemented; anything else is deliberately absent so a gap shows up as a missing
   method rather than as a silently wrong answer."
   (:require [clojure.string :as str]
-            [db.sqlite :as sqlite]))
+            [db.sqlite :as sqlite]
+            [db.pg :as pg]))
 
 ;; --- java.sql constants ------------------------------------------------------
 ;; jdbc.constants maps its keyword options onto these, so they have to read as the
@@ -75,10 +76,6 @@
 (defmacro ^:private sql-try [& body]
   `(try ~@body (catch Exception e# (as-sql-error e#))))
 
-;; db.pg is required lazily, only for a postgres connection, so a sqlite-only app
-;; never needs libpq. Resolve its fns at runtime for the same reason jdbc.core did.
-(defn- pgfn [n] (deref (resolve (symbol "db.pg" n))))
-
 ;; --- driver-facing operations ------------------------------------------------
 (defn- vendor [conn] (tget conn :vendor))
 (defn- handle [conn] (tget conn :handle))
@@ -89,7 +86,7 @@
   (sql-try
     (case (vendor conn)
       :sqlite     (sqlite/query-raw (handle conn) sql params)
-      :postgresql ((pgfn "all-raw") (handle conn) sql params))))
+      :postgresql (pg/all-raw (handle conn) sql params))))
 
 (defn- run-update
   "Execute `sql` and return the number of rows it affected."
@@ -98,7 +95,7 @@
     (case (vendor conn)
       :sqlite     (do (sqlite/query-raw (handle conn) sql params)
                       (sqlite/changes (handle conn)))
-      :postgresql ((pgfn "exec") (handle conn) sql params))))
+      :postgresql (pg/exec (handle conn) sql params))))
 
 ;; --- java.sql.ResultSetMetaData ----------------------------------------------
 (defn- make-rsmeta [labels]
@@ -380,9 +377,8 @@
     (make-connection :sqlite h (fn [] (sqlite/close h)))))
 
 (defn- pg-connection [uri]
-  (require '[db.pg])
-  (let [h ((pgfn "connect") uri)]
-    (make-connection :postgresql h (fn [] ((pgfn "close") h)))))
+  (let [h (pg/connect uri)]
+    (make-connection :postgresql h (fn [] (pg/close h)))))
 
 (defn- pg-uri [{:keys [subname host port user password dbname] :as spec}]
   (let [;; subname is JDBC's //host:port/db

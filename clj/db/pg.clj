@@ -34,9 +34,22 @@
 (def ^:private PGRES-TUPLES-OK 2)
 ;; column type Oids worth coercing back to jolt numbers/booleans/byte-arrays
 (def ^:private int-oids #{20 21 23})            ; int8 / int2 / int4 (+ serial)
-(def ^:private float-oids #{700 701 1700})      ; float4 / float8 / numeric
+(def ^:private float-oids #{700 701})           ; float4 / float8
+(def ^:private numeric-oid 1700)                ; numeric -> bigdec (parse-double lost precision)
 (def ^:private bool-oid 16)
 (def ^:private bytea-oid 17)
+(def ^:private uuid-oid 2950)
+(def ^:private date-oid 1082)
+(def ^:private time-oid 1083)
+(def ^:private timetz-oid 1266)
+(def ^:private ts-oid 1114)                     ; timestamp without time zone
+(def ^:private tstz-oid 1184)                   ; timestamptz
+;; array oid -> element oid, for the types worth walking into. Anything not
+;; here keeps its raw text form.
+(def ^:private array-elem-oid
+  {1000 16, 1005 21, 1007 23, 1016 20, 1021 700, 1022 701, 1231 1700
+   1009 25, 1014 25, 1015 25, 2951 2950
+   1115 1114, 1185 1184, 1182 1082, 1183 1083, 1270 1266})
 
 (defn connect [uri]
   (let [conn (PQconnectdb uri)]
@@ -231,6 +244,16 @@
 (def ^:private TEXT-FORMAT 0)
 (def ^:private BINARY-FORMAT 1)
 
+;; a vector parameter goes over as an array literal ({a,"b c"}), its type left
+;; for postgres to infer — which usually means a cast at the use site
+;; (?::text[]), the shape array-taking SQL is written in anyway.
+(defn- pg-array-el [v]
+  (cond (nil? v)        "NULL"
+        (string? v)     (str "\"" (-> v (str/replace "\\" "\\\\") (str/replace "\"" "\\\"")) "\"")
+        (sequential? v) (str "{" (str/join "," (map pg-array-el v)) "}")
+        :else           (str v)))
+(defn pg-array-literal [xs] (str "{" (str/join "," (map pg-array-el xs)) "}"))
+
 (defn- param-arrays
   "Build PQexecParams' type / value / length / format arrays for `params`.
   Returns [types values lengths formats owned], where owned is every pointer the
@@ -256,6 +279,7 @@
                                              p (ffi/alloc (max 1 len))]
                                          (ffi/write-array p v)
                                          [bytea-oid p len BINARY-FORMAT])
+                            (sequential? v) [INFER-OID (ffi/string->ptr (pg-array-literal v)) 0 TEXT-FORMAT]
                             :else      [INFER-OID (ffi/string->ptr (str v)) 0 TEXT-FORMAT]))
                         params)]
         (dotimes [i n]
@@ -291,21 +315,74 @@
     (PQclear res)
     (or (when n (parse-long n)) 0)))
 
-(defn- coerce [oid s]
-  (cond (int-oids oid)    (parse-long s)
-        (float-oids oid)  (parse-double s)
-        (= bool-oid oid)  (= s "t")
-        (= bytea-oid oid) (bytea->bytes s)
-        :else             s))
+;; --- result value normalization ---------------------------------------------
+;; postgres speaks text on the wire here, so every typed column arrives as a
+;; string; normalize the ones with conventional Clojure/jolt shapes. Temporal
+;; columns become java.time values (jolt-lang/time is a dependency of this
+;; library; its classes autoload on first touch) — a deliberate divergence from
+;; JDBC's java.sql.Timestamp, which jolt does not model. A value the parser
+;; cannot read (postgres 'infinity', for one) keeps its text form rather than
+;; throwing on a read path.
+(defn- try-parse [f s] (try (f s) (catch Exception _ s)))
+(defn- ts->local [s]                     ; "2020-01-02 03:04:05.123456"
+  (java.time.LocalDateTime/parse (str/replace-first s " " "T")))
+(defn- tstz->odt [s]                     ; "... +00" / "...-06"
+  (java.time.OffsetDateTime/parse (str/replace-first s " " "T")))
+(defn- timetz->ot [s]
+  (let [op (some (fn [i] (when (#{\+ \- \Z} (nth s i)) i)) (range (count s)))]
+    (java.time.OffsetTime/of (java.time.LocalTime/parse (subs s 0 op))
+                             (java.time.ZoneOffset/of (subs s op)))))
 
-(defn all-raw
-  "Run `sql` and return {:labels [col-name ...] :rows [[v ...]]}, keeping column
-  order for a caller that reads a row by index. `all` is this with the rows turned
-  into maps."
-  [conn sql params]
-  (let [res (run conn sql params)
-        nrows (PQntuples res)
-        ncols (PQnfields res)
+(declare coerce)
+(defn- parse-pg-array
+  "The text form of an array — {a,\"b,c\",NULL,{...}} with backslash escapes
+  inside quotes — as a vector, elements coerced by `elem-oid`."
+  [s elem-oid]
+  (let [n (count s)
+        elem (fn [e] (coerce elem-oid e))]
+    (letfn [(quoted [i]                  ; i after the opening quote -> [string j]
+              (loop [i i acc []]
+                (let [c (when (< i n) (nth s i))]
+                  (cond
+                    (nil? c) [(apply str acc) i]
+                    (= c \\) (recur (+ i 2) (conj acc (nth s (inc i))))
+                    (= c \") [(apply str acc) (inc i)]
+                    :else (recur (inc i) (conj acc c))))))
+            (elems [i]                   ; i at the opening brace -> [vec j]
+              (loop [i (inc i) acc []]
+                (let [c (when (< i n) (nth s i))]
+                  (cond
+                    (nil? c) [acc i]
+                    (= c \}) [acc (inc i)]
+                    (= c \,) (recur (inc i) acc)
+                    (= c \{) (let [[v j] (elems i)] (recur j (conj acc v)))
+                    (= c \") (let [[e j] (quoted (inc i))] (recur j (conj acc (elem e))))
+                    :else (let [j (loop [j i]
+                                    (if (and (< j n) (not (contains? #{\, \}} (nth s j))))
+                                      (recur (inc j)) j))
+                                raw (subs s i j)]
+                            (recur j (conj acc (when-not (= raw "NULL") (elem raw)))))))))]
+      (first (elems 0)))))
+
+(defn- coerce [oid s]
+  (cond (int-oids oid)        (parse-long s)
+        (float-oids oid)      (parse-double s)
+        (= numeric-oid oid)   (try-parse bigdec s)
+        (= bool-oid oid)      (= s "t")
+        (= bytea-oid oid)     (bytea->bytes s)
+        (= uuid-oid oid)      (or (parse-uuid s) s)
+        (= date-oid oid)      (try-parse (fn [v] (java.time.LocalDate/parse v)) s)
+        (= time-oid oid)      (try-parse (fn [v] (java.time.LocalTime/parse v)) s)
+        (= timetz-oid oid)    (try-parse timetz->ot s)
+        (= ts-oid oid)        (try-parse ts->local s)
+        (= tstz-oid oid)      (try-parse tstz->odt s)
+        (array-elem-oid oid)  (try-parse (fn [v] (parse-pg-array v (array-elem-oid oid))) s)
+        :else                 s))
+
+(defn- read-result
+  "Labels + coerced rows off a PGresult with `ncols` fields (caller clears)."
+  [res ncols]
+  (let [nrows (PQntuples res)
         labels (mapv (fn [c] (PQfname res c)) (range ncols))
         oids (mapv (fn [c] (PQftype res c)) (range ncols))
         rows (mapv (fn [r]
@@ -314,8 +391,31 @@
                                (coerce (nth oids c) (PQgetvalue res r c))))
                            (range ncols)))
                    (range nrows))]
-    (PQclear res)
     {:labels labels :rows rows}))
+
+(defn all-raw
+  "Run `sql` and return {:labels [col-name ...] :rows [[v ...]]}, keeping column
+  order for a caller that reads a row by index. `all` is this with the rows turned
+  into maps."
+  [conn sql params]
+  (let [res (run conn sql params)
+        out (read-result res (PQnfields res))]
+    (PQclear res)
+    out))
+
+(defn execute-any
+  "Run a statement once; {:labels [...] :rows [[...]] :count n} — rows when the
+  result carries fields (SELECT, RETURNING), the affected count otherwise."
+  [conn sql params]
+  (let [res (run conn sql params)
+        ncols (PQnfields res)]
+    (if (pos? ncols)
+      (let [out (read-result res ncols)]
+        (PQclear res)
+        (assoc out :count 0))
+      (let [n (PQcmdTuples res)]
+        (PQclear res)
+        {:labels [] :rows [] :count (or (when (seq n) (parse-long n)) 0)}))))
 
 (defn all [conn sql params]
   (let [{:keys [labels rows]} (all-raw conn sql params)

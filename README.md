@@ -54,6 +54,40 @@ does not depend on the statement offering a `bytea` column for the server to inf
 one from. `["select ? as c" (byte-array [1 2])]` binds a `bytea` and reads back as
 bytes rather than inferring text.
 
+## next.jdbc surface
+
+The `next.jdbc` namespace carries the upstream calling conventions over the
+same drivers: `get-datasource` / `get-connection`, `execute!` / `execute-one!`
+(rows for a result set, `{:next.jdbc/update-count n}` otherwise), `plan` (a
+reducible over the rows), `execute-batch!` (one SQL across a seq of parameter
+groups, answering per-group update counts), and `with-transaction` with its
+options map (`:isolation`, `:read-only`, `:rollback-only`). Every operation
+takes a connection, a datasource, or a db-spec; a datasource or spec opens a
+connection owned by that call. Rows are unqualified lower-cased keyword maps —
+the drivers cannot see table names, so upstream's qualified default is not
+reproducible, and `next.jdbc.result-set` builder markers are accepted and
+ignored.
+
+A datasource is `db.datasource`: an explicit `open-datasource` / `acquire` /
+`release` / `close-datasource` lifecycle over the drivers. It is a connection
+factory, not a pool — pooling can grow behind the same surface later, and this
+library deliberately does not emulate HikariCP.
+
+## PostgreSQL value model
+
+Typed columns normalize to conventional values on the way out: `uuid` columns
+read as uuids, `numeric` as `bigdec` (it used to go through `parse-double`,
+losing precision), `date`/`time`/`timestamp`/`timestamptz` as `java.time`
+values (`LocalDate`/`LocalTime`/`LocalDateTime`/`OffsetDateTime` — a
+deliberate divergence from JDBC's `java.sql.Timestamp`, which jolt does not
+model), and arrays of the common element types as vectors (quoting, `NULL`
+elements and nesting honoured). A value the parser cannot read — postgres
+`infinity`, say — keeps its text form rather than throwing on a read path.
+
+Parameters: uuids and temporal values bind as their text form and postgres
+infers the type; a vector binds as an array literal, which pairs with a cast
+at the use site (`?::text[]`). SQLite stores anything it does not know as text.
+
 ## Errors
 
 Database errors satisfy `(catch java.sql.SQLException ...)`, so code written

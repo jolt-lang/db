@@ -29,6 +29,7 @@
 (ffi/defcfn sqlite3-bind-double   "sqlite3_bind_double"   [:pointer :int :double] :int)
 (ffi/defcfn sqlite3-bind-null     "sqlite3_bind_null"     [:pointer :int] :int)
 (ffi/defcfn sqlite3-changes       "sqlite3_changes"       [:pointer] :int)
+(ffi/defcfn sqlite3-total-changes "sqlite3_total_changes" [:pointer] :int)
 (ffi/defcfn sqlite3-last-rowid    "sqlite3_last_insert_rowid" [:pointer] :int64)
 
 (def ^:private SQLITE-OK 0)
@@ -123,4 +124,8 @@
     (mapv (fn [vs] (zipmap ks vs)) rows)))
 
 (defn changes [db] (sqlite3-changes db))
+;; changes() reports the LAST row-changing statement, so it reads stale after
+;; DDL; a before/after delta of total-changes answers "what did THIS statement
+;; change" for any statement.
+(defn total-changes [db] (sqlite3-total-changes db))
 (defn last-insert-rowid [db] (sqlite3-last-rowid db))

@@ -13,9 +13,16 @@
                                         (conj (or (jolt.host/ref-get self :batch) []) sql))
                     nil)
    "executeBatch" (fn [self]
+                    ;; JDBC's int[] of per-statement update counts. execute!
+                    ;; answers the upstream row/update-count shape now, so read
+                    ;; the count back out of it.
                     (let [conn (jolt.host/ref-get self :conn)
                           sqls (or (jolt.host/ref-get self :batch) [])
-                          res  (mapv (fn [s] (njdbc/execute! conn s)) sqls)]
+                          res  (mapv (fn [s]
+                                       (let [r (njdbc/execute! conn s)]
+                                         (or (:next.jdbc/update-count (first r))
+                                             (count r))))
+                                     sqls)]
                       (jolt.host/ref-put! self :batch [])
                       res))
    "clearBatch"   (fn [self] (jolt.host/ref-put! self :batch []) nil)

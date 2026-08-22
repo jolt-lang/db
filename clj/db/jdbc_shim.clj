@@ -97,6 +97,23 @@
                       (sqlite/changes (handle conn)))
       :postgresql (pg/exec (handle conn) sql params))))
 
+(defn execute-any
+  "Execute `sql` ONCE and report both faces: {:labels [...] :rows [[...]]
+  :count n}. A statement that returns a result set (SELECT, RETURNING) fills
+  labels/rows; one that does not reports its update count. next.jdbc's
+  execute!/execute-one!/plan sit on this, so they never run a statement twice
+  to learn which kind it was."
+  [conn sql params]
+  (sql-try
+    (case (vendor conn)
+      :sqlite     (let [before (sqlite/total-changes (handle conn))
+                        {:keys [labels rows]} (sqlite/query-raw (handle conn) sql params)]
+                    {:labels labels :rows rows
+                     ;; a total-changes delta, not changes(): changes() reads
+                     ;; stale after DDL (it reports the last DML statement)
+                     :count (if (seq labels) 0 (- (sqlite/total-changes (handle conn)) before))})
+      :postgresql (pg/execute-any (handle conn) sql params))))
+
 ;; --- java.sql.ResultSetMetaData ----------------------------------------------
 (defn- make-rsmeta [labels]
   (let [t (tt :jdbc/rsmeta)] (tput! t :labels labels) t))

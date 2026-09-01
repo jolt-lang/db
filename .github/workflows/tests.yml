@@ -29,3 +29,11 @@ jobs:
           echo "$HOME/.jolt" >> "$GITHUB_PATH"
       - name: Test
         run: JOLT_TEST_PG_URI=postgres://postgres:postgres@127.0.0.1:5432/jolt_test JOLT_PWD="$PWD" jolt -M:test
+
+      # clojure.jdbc's OWN suite, from its tree at the sha deps.edn pins. This
+      # library's job is to run the published clojure.jdbc unmodified, and only
+      # upstream's tests can say whether it still does — the suite here is ours
+      # and agrees with our own idea of the API. It ran for the first time in
+      # #15 and found five gaps.
+      - name: clojure.jdbc conformance
+        run: ./ci/clojure-jdbc-conformance.sh

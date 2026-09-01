@@ -5,6 +5,16 @@
 
  :paths ["clj"]
 
+ ;; The java.sql classes db.jdbc-shim installs (RFC 0014). clojure.jdbc resolves
+ ;; these as its namespaces COMPILE, so the reference lands before anything of
+ ;; this library has loaded; declaring them here is what lets jolt autoload the
+ ;; shim on that first miss, for a project that depends on db and no other.
+ ;; Fully-qualified only — jolt derives the simple spelling.
+ :jolt/provides {db.jdbc-shim ["java.sql.ResultSet"
+                               "java.sql.Connection"
+                               "java.sql.Statement"
+                               "java.sql.DriverManager"]}
+
  ;; clojure.jdbc is the API this library exposes: the published library running on
  ;; the java.sql shim in db.jdbc-shim, rather than a reimplementation of it here.
  ;; Require db.jdbc once before jdbc.core so the shim is registered first.

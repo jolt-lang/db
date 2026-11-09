@@ -14,10 +14,9 @@
       (with-open [conn (jdbc/connection \"sqlite::memory:\")]
         (jdbc/fetch conn \"select 1 as one\"))
 
-  Not wired in yet. While this repo still ships its own clj/jdbc/core.clj, that
-  copy shadows the dependency on the classpath and the require below resolves to it
-  rather than to clojure.jdbc, so this namespace only does what it says once that
-  file is removed."
+  A program that never requires this namespace still gets a connection: the
+  shim also serves java.sql.DriverManager, which is where clojure.jdbc's own
+  dbspec path ends up."
   (:require [db.jdbc-shim :as shim]
             [jdbc.proto :as proto]
             [jdbc.core]))

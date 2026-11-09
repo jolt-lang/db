@@ -28,6 +28,14 @@
 
     (check "execute! answers rows for a select" [{:one 1}]
            (nj/execute! conn ["select 1 as one"]))
+
+    ;; next.jdbc's insert! answers the generated keys, not an update count.
+    (nj/execute! conn "create table ins (id integer primary key, name text)")
+    (check "sql/insert! answers the generated keys" {:id 1 :name "ada"}
+           (sql/insert! conn :ins {:name "ada"}))
+    (check "sql/insert! {:return-keys false} answers the update count"
+           {:next.jdbc/update-count 1}
+           (sql/insert! conn :ins {:name "bo"} {:return-keys false}))
     (check "execute! answers an update-count row for DML" [{:next.jdbc/update-count 1}]
            (nj/execute! conn ["insert into t (x) values (?)" 10]))
 

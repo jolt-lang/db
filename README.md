@@ -37,6 +37,31 @@ which is what postgres' own driver gives; a sequence of column names asks for
 those. Without it there are no generated keys to report, so `insert!` falls back
 to the update count, exactly as clojure.jdbc does on a driver that has none.
 
+`insert!` with `{:returning [:id]}` answers `({:id 1})`. `next.jdbc.sql/insert!`
+answers the generated keys map, the whole inserted row, as next.jdbc does;
+`{:return-keys false}` gives `{:next.jdbc/update-count 1}` instead.
+
+## Migratus
+
+[migratus](https://github.com/yogthos/migratus) runs on the `next.jdbc` surface
+here, but two of its dependencies have to be replaced. Its `next.jdbc` would
+shadow this library's, so exclude it, and `clojure.tools.logging` from Maven
+fails at load with "Valid logging implementation could not be found", so
+override it with [jolt-lang/logging](https://github.com/jolt-lang/logging),
+which provides the same namespace:
+
+```clojure
+{:deps {io.github.jolt-lang/db {:git/url "https://github.com/jolt-lang/db" :git/sha "..."}
+        migratus/migratus {:git/url "https://github.com/yogthos/migratus"
+                           :git/tag "v1.6.6" :git/sha "b47dbbe721f217c88a5e5a8938534df00c62ca5d"
+                           :exclusions [com.github.seancorfield/next.jdbc]}
+        org.clojure/tools.logging {:git/url "https://github.com/jolt-lang/logging"
+                                   :git/tag "v0.0.2" :git/sha "ec6747e55583118d881faf4ab41e68d7e587ce4c"}}}
+```
+
+Pass migratus a `:connection-uri` such as `"jdbc:sqlite:app.db"` or a
+`postgres://` uri.
+
 ## Binary values
 
 A byte array parameter binds as a SQLite `blob` / postgres `bytea`, and those

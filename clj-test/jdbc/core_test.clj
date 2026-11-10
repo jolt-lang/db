@@ -35,6 +35,12 @@
     (check "insert! :returning gives the inserted row" {:id 4 :name "edsger" :zip 1}
            (first (jdbc/insert! conn :person {:name "edsger" :zip 1} {:returning true})))
     (jdbc/delete! conn :person ["name = ?" "edsger"])
+    ;; clojure.jdbc hands the column names to prepareStatement as a String[],
+    ;; which is not sequential?; it used to be dropped and the insert reported
+    ;; its update count instead of the key.
+    (check "insert! :returning [:id] gives the generated id" '({:id 4})
+           (jdbc/insert! conn :person {:name "barbara" :zip 2} {:returning [:id]}))
+    (jdbc/delete! conn :person ["name = ?" "barbara"])
     (check "fetch sqlvec with params" [{:id 1 :name "ada" :zip 94546}]
            (jdbc/fetch conn ["select * from person where name = ?" "ada"]))
     (check "fetch-one" {:id 3 :name "alan" :zip 10001}
@@ -276,6 +282,17 @@
                  (vec (:c (jdbc/fetch-one conn ["select ? as c" big]))))))
       (jdbc/execute! conn "drop table jolt_payload")
       (jdbc/execute! conn "drop table jolt_person")))
+
+  ;; The :vendor/:name dbspec when db.jdbc's IConnection extension is not the
+  ;; one that answers: clojure.jdbc turns it into "//127.0.0.1/<name>" and goes
+  ;; through DriverManager, which used to try to open that as a file.
+  (println "java.sql.DriverManager for a :vendor/:name dbspec")
+  (with-open [conn (java.sql.DriverManager/getConnection "jdbc:sqlite://127.0.0.1/:memory:")]
+    (check "DriverManager sqlite url with clojure.jdbc's default host" [{:one 1}]
+           (jdbc/fetch conn "select 1 as one")))
+  (with-open [conn (java.sql.DriverManager/getConnection "jdbc:sqlite://localhost:5432/:memory:")]
+    (check "DriverManager sqlite url with host and port" [{:one 1}]
+           (jdbc/fetch conn "select 1 as one")))
 
   (next-jdbc-test/run check)
 

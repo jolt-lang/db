@@ -12,9 +12,17 @@
   ([conn q opts] (jc/fetch (njdbc/conn-raw conn) q (dissoc opts :builder-fn))))
 
 (defn insert!
-  "Insert one row map into table. Returns the generated id (sqlite)."
+  "Insert one row map into table and return the generated keys, as next.jdbc
+  does. Neither driver has a generated-keys channel, so they come back through
+  RETURNING * and the map is the whole inserted row, which is also what
+  postgres' own JDBC driver reports. {:return-keys false} answers
+  {:next.jdbc/update-count n} instead, as next.jdbc's execute-one! does."
   ([conn table key-map] (insert! conn table key-map {}))
-  ([conn table key-map _opts] (jc/insert! (njdbc/conn-raw conn) table key-map {})))
+  ([conn table key-map opts]
+   (let [raw (njdbc/conn-raw conn)]
+     (if (false? (:return-keys opts))
+       {:next.jdbc/update-count (first (jc/insert! raw table key-map {}))}
+       (first (jc/insert! raw table key-map {:returning true}))))))
 
 (defn delete!
   "Delete rows. where-params is [where-clause & params], e.g. [\"id=?\" 7]."

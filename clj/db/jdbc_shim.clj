@@ -319,7 +319,11 @@
                                          (cond
                                            (nil? a) {}
                                            (number? a) (if (= 1 a) {:returning :all} {})
-                                           (sequential? a) {:returning (vec a)}
+                                           ;; clojure.jdbc passes the column
+                                           ;; names as a String[], which is not
+                                           ;; sequential?
+                                           (or (sequential? a) (.isArray (class a)))
+                                           {:returning (vec a)}
                                            :else {}))))
 
    "setAutoCommit" (fn [self v]
@@ -477,6 +481,17 @@
              hostport)
          "/" (or (when-not (str/blank? db) db) dbname (:name spec)))))
 
+;; clojure.jdbc's uri->dbspec leaves "//" in front of the subname
+;; ("jdbc:sqlite://:memory:"), and its :vendor/:name form builds
+;; "//<host>[:port]/<name>" with host defaulting to 127.0.0.1. A host means
+;; nothing to sqlite, so the local spellings of one are dropped; anything else
+;; is left as the path it already was.
+(defn- sqlite-name [n]
+  (let [n (str n)]
+    (if-let [[_ nm] (re-matches #"//(?:127\.0\.0\.1|localhost)(?::\d+)?/(.*)" n)]
+      nm
+      (if (str/starts-with? n "//") (subs n 2) n))))
+
 (defn connection
   "Open a java.sql.Connection shim for a clojure.jdbc dbspec. Recognises the
   classic :subprotocol/:subname form, the pretty :vendor/:name form, and a uri
@@ -498,8 +513,7 @@
       (cond
         (contains? #{"postgresql" "postgres" "pgsql"} v) (pg-connection (pg-uri spec))
         (contains? #{"sqlite" "sqlite3"} v)
-        (sqlite-connection (let [n (or (:subname spec) (:name spec))]
-                             (if (str/starts-with? (str n) "//") (subs (str n) 2) (str n))))
+        (sqlite-connection (sqlite-name (or (:subname spec) (:name spec))))
         :else (sql-error (str "unsupported vendor for this driver: " v))))
 
     :else (sql-error (str "invalid dbspec: " (pr-str spec)))))

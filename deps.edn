@@ -25,7 +25,7 @@
  :deps {io.github.yogthos/clojure.jdbc {:git/url "https://github.com/yogthos/clojure.jdbc.git"
                                         :git/sha "f6c88efb2db79533047f2aa8c4e490cfed500bcd"}
         io.github.jolt-lang/time {:git/url "https://github.com/jolt-lang/time.git"
-                                  :git/sha "753905d0e694600f593b9904e880a8a8379fb7b1"}}
+                                  :git/sha "80e5fc22d9ddd8ee2f2f525580fbc643d0ecba4c"}}
 
  ;; SQLite (libsqlite3) and PostgreSQL (libpq) are bound natively via jolt.ffi
  ;; (db.sqlite / db.pg). The shared libraries are declared below; jolt loads them

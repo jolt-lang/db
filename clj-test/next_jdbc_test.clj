@@ -90,6 +90,17 @@
         (nj/execute! tx ["insert into d (x) values (?)" 6]))
       (check "with-transaction on a datasource commits and closes" 2
              (count (nj/execute! fd ["select * from d"])))
+      (check "sql/query accepts a datasource" [{:x 5} {:x 6}]
+             (sql/query fd ["select * from d order by x"]))
+      (nj/execute! fd "create table di (id integer primary key, x integer)")
+      (check "sql/insert! accepts a datasource" {:id 1 :x 7}
+             (sql/insert! fd :di {:x 7}))
+      (check "sql/delete! accepts a datasource and a map where-clause"
+             {:next.jdbc/update-count 1}
+             (sql/delete! fd :di {:x 7}))
+      (check "sql/delete! accepts a [where & params] vector"
+             {:next.jdbc/update-count 2}
+             (sql/delete! fd :d ["x > ?" 0]))
       (ds/close-datasource fd)
       (check "acquire after close-datasource throws" :closed
              (try (ds/acquire fd) :open (catch Exception _ :closed)))

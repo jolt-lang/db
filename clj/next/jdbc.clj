@@ -110,7 +110,7 @@
     (ds/datasource? spec) (wrap-conn (ds/acquire spec))
     :else (wrap-conn (jc/connection (normalize-spec spec)))))
 
-(defn- call-with-connection
+(defn call-with-connection
   "Run f with a wrapped connection for `connectable`. A datasource or a bare
   spec opens a connection OWNED by this call (closed on the way out); an
   existing connection is used as-is and left open."

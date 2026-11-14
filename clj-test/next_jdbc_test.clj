@@ -6,9 +6,66 @@
             [next.jdbc :as nj]
             [next.jdbc.sql :as sql]
             [next.jdbc.sql.builder :as b]
+            [jdbc.proto]
+            [db.pg]
             [db.datasource :as ds]))
 
 (defn- threw? [f] (try (f) :returned (catch Exception _ :threw)))
+
+(defn- batch-checks
+  "Batched execution over `conn`, shared by the sqlite and postgres runs. The
+  table is created here; `id-col` is that backend's autoincrement column DDL."
+  [check tag conn id-col]
+  (let [label (fn [s] (str tag " " s))
+        rows  (fn [] (nj/execute! conn ["select a, b from bt order by b"]))]
+    (nj/execute! conn "drop table if exists bt")
+    (nj/execute! conn (str "create table bt (id " id-col ", a text unique, b integer)"))
+    (check (label "execute-batch! answers per-group counts") [1 1 1]
+           (nj/execute-batch! conn "insert into bt (a, b) values (?, ?)" [["x" 1] ["y" 2] ["z" 3]] {}))
+    (check (label "execute-batch! with no groups answers []") []
+           (nj/execute-batch! conn "insert into bt (a, b) values (?, ?)" [] {}))
+    (check (label "execute-batch! :return-generated-keys answers the RETURNING rows")
+           [{:a "p" :b 4} {:a "q" :b 5}]
+           (nj/execute-batch! conn "insert into bt (a, b) values (?, ?) returning a, b"
+                              [["p" 4] ["q" 5]] {:return-generated-keys true}))
+    (check (label "a failing group throws BatchUpdateException") :batch-update
+           (try (nj/execute-batch! conn "insert into bt (a, b) values (?, ?)" [["r" 6] ["x" 7] ["s" 8]] {})
+                :returned
+                (catch java.sql.BatchUpdateException _ :batch-update)))
+    (check (label "outside a transaction a failed batch rolls back whole") 5
+           (count (rows)))
+    (nj/with-transaction [tx conn {:rollback-only true}]
+      (nj/execute-batch! tx "insert into bt (a, b) values (?, ?)" [["t" 9] ["u" 10]] {}))
+    (check (label "inside with-transaction the batch joins it") 5 (count (rows)))
+    (nj/execute! conn "BEGIN")
+    (nj/execute-batch! conn "insert into bt (a, b) values (?, ?)" [["v" 11]] {})
+    (nj/execute! conn "ROLLBACK")
+    (check (label "a transaction opened with a raw BEGIN is joined, not nested") 5 (count (rows)))
+    (check (label "a large batch") 3000
+           (count (nj/execute-batch! conn "insert into bt (a, b) values (?, ?)"
+                                     (map (fn [i] [(str "big" i) (+ 100 i)]) (range 3000)) {})))
+    (let [sc (jdbc.proto/connection (nj/conn-raw conn))
+          ps (.prepareStatement sc "insert into bt (a, b) values (?, ?)" 1)]
+      (doseq [[a b] [["m1" 9001] ["m2" 9002]]]
+        (.setObject ps 1 a) (.setObject ps 2 b) (.addBatch ps))
+      (check (label "PreparedStatement.executeBatch answers per-group counts") [1 1]
+             (vec (.executeBatch ps)))
+      (check (label "getGeneratedKeys after executeBatch covers every group") [9001 9002]
+             (let [rs (.getGeneratedKeys ps)]
+               (loop [acc []] (if (.next rs) (recur (conj acc (.getObject rs "b"))) acc)))))
+    (nj/execute! conn "delete from bt")
+    ;; more parameters than one statement may carry, so it has to be chunked
+    (let [n 20000
+          out (sql/insert-multi! conn :bt [:a :b] (map (fn [i] [(str "r" i) i]) (range n)) {:batch true})]
+      (check (label "insert-multi! :batch chunks past the parameter limit") n (count out))
+      (check (label "insert-multi! :batch keeps row order") [0 1 (dec n)]
+             [(:b (first out)) (:b (second out)) (:b (last out))])
+      (check (label "insert-multi! :batch rows all landed") n (count (rows))))
+    (check (label "insert-multi! :batch failure rolls back every chunk") :threw
+           (threw? #(sql/insert-multi! conn :bt [:a :b] (concat (map (fn [i] [(str "n" i) i]) (range 20000)) [["r0" 0]])
+                                       {:batch true})))
+    (check (label "after the failed insert-multi! nothing was added") 20000 (count (rows)))
+    (nj/execute! conn "drop table bt")))
 
 (defn run [check]
   (println "next.jdbc surface over sqlite (:memory:)")
@@ -176,6 +233,13 @@
     (check "for-delete with :table-fn" ["DELETE FROM T WHERE id = ?" 7]
            (b/for-delete :t ["id = ?" 7] {:table-fn clojure.string/upper-case})))
 
+  (println "batches over sqlite")
+  (let [f (str "/tmp/njdbc-batch-" (System/currentTimeMillis) ".db")
+        conn (nj/get-connection {:dbtype "sqlite" :dbname f})]
+    (batch-checks check "sqlite" conn "integer primary key")
+    (.close conn)
+    (.delete (java.io.File. f)))
+
   (println "datasources")
   (let [d (nj/get-datasource {:dbtype "sqlite" :dbname ":memory:"})]
     (check "get-datasource answers instance? DataSource" true
@@ -255,6 +319,19 @@
              (:c (nj/execute-one! conn ["select ?::text[] as c" ["x" "y z"]])))
       (check "pg execute-batch! over param groups" [1 1]
              (nj/execute-batch! conn "insert into nj_vals (n) values (?::numeric)" [["1"] ["2"]] {}))
+      (println "batches over postgres (pipelined)")
+      (batch-checks check "pg" conn "serial primary key")
+      (println "batches over postgres (no pipeline, as on libpq < 14)")
+      (binding [db.pg/*pipeline* false]
+        (batch-checks check "pg/nopipe" conn "serial primary key"))
+      (nj/execute! conn "drop table if exists nj_b")
+      (nj/execute! conn "create table nj_b (id serial primary key, v bytea)")
+      (check "pg batch binds byte arrays" [[1 2 3] [255]]
+             (do (nj/execute-batch! conn "insert into nj_b (v) values (?)"
+                                    [[(byte-array [1 2 3])] [(byte-array [-1])]] {})
+                 (mapv (fn [r] (mapv #(bit-and % 255) (:v r)))
+                       (nj/execute! conn ["select v from nj_b order by id"]))))
+      (nj/execute! conn "drop table nj_b")
       (nj/execute! conn "drop table if exists nj_p")
       (nj/execute! conn "create table nj_p (id serial primary key, name text)")
       (doseq [n ["a" "b" "c"]] (sql/insert! conn :nj_p {:name n}))

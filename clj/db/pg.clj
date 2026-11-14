@@ -28,10 +28,25 @@
 (ffi/defcfn PQgetvalue         "PQgetvalue"         [:pointer :int :int] :string)
 (ffi/defcfn PQgetisnull        "PQgetisnull"        [:pointer :int :int] :int)
 (ffi/defcfn PQclear            "PQclear"            [:pointer] :void)
+(ffi/defcfn PQlibVersion       "PQlibVersion"       [] :int)
+(ffi/defcfn PQtransactionStatus "PQtransactionStatus" [:pointer] :int)
+(ffi/defcfn PQprepare          "PQprepare"          [:pointer :string :string :int :pointer] :pointer)
+(ffi/defcfn PQexecPrepared     "PQexecPrepared"     [:pointer :string :int :pointer :pointer :pointer :int] :pointer)
+;; pipeline mode, libpq 14+. Bound lazily like the rest, so an older libpq only
+;; fails if these are called, and execute-batch checks the version first.
+(ffi/defcfn PQsendPrepare      "PQsendPrepare"      [:pointer :string :string :int :pointer] :int)
+(ffi/defcfn PQsendQueryPrepared "PQsendQueryPrepared" [:pointer :string :int :pointer :pointer :pointer :int] :int)
+(ffi/defcfn PQenterPipelineMode "PQenterPipelineMode" [:pointer] :int)
+(ffi/defcfn PQexitPipelineMode "PQexitPipelineMode" [:pointer] :int)
+(ffi/defcfn PQpipelineSync     "PQpipelineSync"     [:pointer] :int)
+(ffi/defcfn PQgetResult        "PQgetResult"        [:pointer] :pointer)
 
 (def ^:private CONNECTION-OK 0)
 (def ^:private PGRES-COMMAND-OK 1)
 (def ^:private PGRES-TUPLES-OK 2)
+(def ^:private PGRES-PIPELINE-SYNC 10)
+(def ^:private PGRES-PIPELINE-ABORTED 11)
+(def ^:private PQTRANS-IDLE 0)
 ;; column type Oids worth coercing back to jolt numbers/booleans/byte-arrays
 (def ^:private int-oids #{20 21 23})            ; int8 / int2 / int4 (+ serial)
 (def ^:private float-oids #{700 701})           ; float4 / float8
@@ -421,3 +436,146 @@
   (let [{:keys [labels rows]} (all-raw conn sql params)
         ks (mapv keyword labels)]
     (mapv (fn [vs] (zipmap ks vs)) rows)))
+
+;; --- batches -------------------------------------------------------------------
+;; A batch is one statement run over many parameter groups. It is prepared once
+;; (the unnamed statement) and executed per group. With libpq 14+ the executions
+;; are pipelined: sent back to back and their results read afterwards, so a batch
+;; costs a round trip per chunk rather than one per row, which is what pgjdbc's
+;; batches do too.
+
+(def ^:dynamic *pipeline*
+  "nil picks pipeline mode when libpq is 14 or newer; true or false forces it."
+  nil)
+
+(def ^:private pipeline-chunk
+  ;; groups sent before a sync. A blocking connection that writes without
+  ;; reading can stall once the server's output fills the socket, so results are
+  ;; drained every chunk.
+  500)
+
+(defn- pipeline? []
+  (if (nil? *pipeline*) (>= (PQlibVersion) 140000) *pipeline*))
+
+(defn- batch-types
+  "The Oids the statement is prepared with: bytea where any group passes a byte
+  array at that position (it goes over in binary), inferred everywhere else."
+  [n groups]
+  (let [os (ffi/sizeof :uint)
+        types (ffi/alloc (* (max 1 n) os))]
+    (dotimes [i n]
+      (ffi/write types :uint (if (some #(bytes? (nth % i nil)) groups) bytea-oid INFER-OID) (* i os)))
+    types))
+
+(defn- group-result
+  "{:labels :rows :count} off a group's PGresult (caller clears)."
+  [res]
+  (let [ncols (PQnfields res)
+        n (PQcmdTuples res)
+        cnt (or (when (seq n) (parse-long n)) 0)]
+    (if (pos? ncols)
+      (assoc (read-result res ncols) :count cnt)
+      {:labels [] :rows [] :count cnt})))
+
+(defn- check-result! [res sql]
+  (let [st (PQresultStatus res)]
+    (when-not (or (= st PGRES-COMMAND-OK) (= st PGRES-TUPLES-OK))
+      (let [msg (PQresultErrorMessage res)] (PQclear res)
+        (throw (ex-info (str "pg query failed: " msg) {:sql sql :jdbc/sql-error true}))))
+    res))
+
+(defn- send-group! [conn group]
+  (let [[_ values lengths formats owned] (param-arrays group)
+        ok (PQsendQueryPrepared conn "" (count group) values lengths formats 0)]
+    (doseq [p owned] (ffi/free p))
+    (when-not (= 1 ok)
+      (throw (ex-info (str "pg send failed: " (PQerrorMessage conn)) {:jdbc/sql-error true})))))
+
+(defn- drain-to-sync
+  "Read results up to the next sync point: [group-results first-error]. NULL
+  separates one statement's results from the next; two in a row mean nothing
+  is pending, which only a broken connection produces."
+  [conn]
+  (loop [acc (transient []) err nil nulls 0]
+    (let [res (PQgetResult conn)]
+      (if (ffi/null? res)
+        (if (pos? nulls)
+          [(persistent! acc) (or err (str "pg pipeline ended early: " (PQerrorMessage conn)))]
+          (recur acc err (inc nulls)))
+        (let [st (PQresultStatus res)]
+          (cond
+            (= st PGRES-PIPELINE-SYNC) (do (PQclear res) [(persistent! acc) err])
+            (or (= st PGRES-COMMAND-OK) (= st PGRES-TUPLES-OK))
+            (let [r (group-result res)] (PQclear res) (recur (conj! acc r) err 0))
+            (= st PGRES-PIPELINE-ABORTED) (do (PQclear res) (recur acc err 0))
+            :else (let [msg (PQresultErrorMessage res)]
+                    (PQclear res)
+                    (recur acc (or err msg) 0))))))))
+
+(defn- batch-pipelined [conn sql groups n types]
+  (when-not (= 1 (PQenterPipelineMode conn))
+    (throw (ex-info (str "pg could not enter pipeline mode: " (PQerrorMessage conn))
+                    {:jdbc/sql-error true})))
+  (try
+    (when-not (= 1 (PQsendPrepare conn "" sql n types))
+      (throw (ex-info (str "pg send failed: " (PQerrorMessage conn)) {:jdbc/sql-error true})))
+    (loop [chunks (partition-all pipeline-chunk groups) out [] first? true]
+      (if-not (seq chunks)
+        out
+        (do
+          (try
+            (doseq [g (first chunks)] (send-group! conn g))
+            (catch Exception e
+              ;; what was sent still has results coming; read them off so
+              ;; the connection can leave pipeline mode
+              (PQpipelineSync conn)
+              (drain-to-sync conn)
+              (throw e)))
+          (PQpipelineSync conn)
+          (let [[rs err] (drain-to-sync conn)]
+            (when err
+              (throw (ex-info (str "pg query failed: " err) {:sql sql :jdbc/sql-error true})))
+            ;; the first result of the first chunk answers the PREPARE
+            (recur (rest chunks) (into out (if first? (rest rs) rs)) false)))))
+    (finally (PQexitPipelineMode conn))))
+
+(defn- batch-serial [conn sql groups n types]
+  (PQclear (check-result! (PQprepare conn "" sql n types) sql))
+  (mapv (fn [g]
+          (let [[_ values lengths formats owned] (param-arrays g)
+                res (PQexecPrepared conn "" (count g) values lengths formats 0)]
+            (doseq [p owned] (ffi/free p))
+            (check-result! res sql)
+            (let [r (group-result res)] (PQclear res) r)))
+        groups))
+
+(defn execute-batch
+  "Run `sql` once per parameter group in `groups`, preparing it once. Answers a
+  vector of {:labels :rows :count}, one per group.
+
+  Outside a transaction the batch runs inside one, so it lands whole or not at
+  all; inside one (however it was opened) it joins it."
+  [conn sql groups]
+  (if (empty? groups)
+    []
+    (let [psql (pg-placeholders sql)
+          n (count (first groups))
+          types (batch-types n groups)
+          own-tx? (= PQTRANS-IDLE (PQtransactionStatus conn))]
+      (try
+        (when own-tx? (exec conn "BEGIN" []))
+        (let [out (if (pipeline?)
+                    (batch-pipelined conn psql groups n types)
+                    (batch-serial conn psql groups n types))]
+          (when own-tx? (exec conn "COMMIT" []))
+          out)
+        (catch Exception e
+          (when (and own-tx? (not= PQTRANS-IDLE (PQtransactionStatus conn)))
+            (exec conn "ROLLBACK" []))
+          (throw e))
+        (finally (ffi/free types))))))
+
+(defn max-params
+  "The most parameters one statement may carry: the protocol's 16-bit count."
+  [_conn]
+  65535)

@@ -52,6 +52,15 @@ ANSI syntax; here they all become `LIMIT`/`OFFSET`, which both SQLite and
 PostgreSQL accept, so any of them works on either backend. Only one of `:top`,
 `:limit` and `:fetch` can be given at a time.
 
+Batches compile their statement once. `next.jdbc/execute-batch!` and JDBC
+`PreparedStatement.executeBatch` bind each parameter group to one prepared
+statement; on PostgreSQL with libpq 14 or newer the executions are pipelined, so
+a batch costs one round trip per 500 groups instead of one per row (older libpq
+still prepares once, but waits on each row). Outside a transaction a batch runs
+in one of its own, so it lands whole or not at all; inside one it joins it.
+`insert-multi!` with `:batch` writes multi-row `INSERT`s sized to the
+parameter limit and runs them as one such batch.
+
 ## Migratus
 
 [migratus](https://github.com/yogthos/migratus) runs on the `next.jdbc` surface

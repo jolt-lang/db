@@ -1,110 +1,118 @@
 (ns next.jdbc.sql
-  "The next.jdbc.sql friendly functions (query, insert!, update!, delete!,
-  find-by-keys, get-by-id), over jdbc.core.
-  Every function takes a connectable, as upstream does: an open connection, a
-  datasource or a db-spec (opened and closed per call). next.jdbc result-set
-  builder-fns are ignored because jdbc.core already returns unqualified,
-  lower-cased, keyword-keyed row maps."
-  (:require [clojure.string :as str]
-            [jdbc.core :as jc]
-            [next.jdbc :as njdbc]))
+  "next.jdbc.sql's friendly functions: query, insert!, insert-multi!, update!,
+  delete!, find-by-keys, aggregate-by-keys and get-by-id, with upstream's
+  options (see next.jdbc.sql.builder). Every function takes a connectable: an
+  open connection, a datasource or a db-spec (opened and closed per call).
 
-(defn- with-raw
-  "Call f with the raw jdbc.core connection behind `connectable`."
-  [connectable f]
-  (njdbc/call-with-connection connectable (fn [w] (f (njdbc/conn-raw w)))))
+  Rows are unqualified lower-cased keyword maps (see next.jdbc), so
+  result-set builder-fns are ignored. Generated keys come back through
+  RETURNING *, as neither driver has a generated-keys channel: they are the
+  whole inserted row, which is also what postgres' own JDBC driver reports."
+  (:require [jdbc.core :as jc]
+            [next.jdbc :as njdbc]
+            [next.jdbc.sql.builder :as b]))
+
+(defn- with-dialect
+  "Call (f w opts) on a connection for `connectable`, with the database's
+  product name in opts for the builders."
+  [connectable opts f]
+  (njdbc/call-with-connection connectable
+    (fn [w]
+      (f w (assoc opts ::b/dialect (.getDatabaseProductName (.getMetaData w)))))))
 
 (defn query
   "Run [sql & params] (or a sql string) and return a vector of row maps."
   ([connectable q] (query connectable q {}))
   ([connectable q opts]
-   (with-raw connectable #(jc/fetch % q (dissoc opts :builder-fn)))))
+   (njdbc/call-with-connection connectable
+     (fn [w] (jc/fetch (njdbc/conn-raw w) q (dissoc opts :builder-fn))))))
+
+(defn- returning [[sql & params] opts]
+  (if (false? (:return-keys opts))
+    (into [sql] params)
+    (into [(str sql " RETURNING *")] params)))
 
 (defn insert!
-  "Insert one row map into table and return the generated keys, as next.jdbc
-  does. Neither driver has a generated-keys channel, so they come back through
-  RETURNING * and the map is the whole inserted row, which is also what
-  postgres' own JDBC driver reports. {:return-keys false} answers
-  {:next.jdbc/update-count n} instead, as next.jdbc's execute-one! does."
+  "Insert one row map into table and return the generated keys (the inserted
+  row), or nil when a :suffix such as ON CONFLICT DO NOTHING skipped it.
+  {:return-keys false} answers {:next.jdbc/update-count n} instead."
   ([connectable table key-map] (insert! connectable table key-map {}))
   ([connectable table key-map opts]
-   (with-raw connectable
-     (fn [raw]
-       (if (false? (:return-keys opts))
-         {:next.jdbc/update-count (first (jc/insert! raw table key-map {}))}
-         (first (jc/insert! raw table key-map {:returning true})))))))
+   (njdbc/execute-one! connectable (returning (b/for-insert table key-map opts) opts) opts)))
 
-(defn- where-clause
-  "A next.jdbc where: a column->value map (nil matches IS NULL) or
-  [where-sql & params]."
-  [where]
-  (if (map? where)
-    (let [ks (keys where)]
-      (into [(str/join " AND " (map (fn [k] (str (name k) (if (nil? (get where k)) " IS NULL" " = ?"))) ks))]
-            (remove nil? (map #(get where %) ks))))
-    where))
-
-(defn delete!
-  "Delete rows matching where-params, a column->value map or
-  [where-clause & params] such as [\"id=?\" 7]. Answers
-  {:next.jdbc/update-count n}, as upstream does."
-  ([connectable table where-params] (delete! connectable table where-params {}))
-  ([connectable table where-params _opts]
-   (let [[where & params] (where-clause where-params)]
-     (njdbc/execute-one! connectable
-                         (into [(str "DELETE FROM " (name table)
-                                     (when-not (str/blank? where) (str " WHERE " where)))]
-                               params)))))
+(defn insert-multi!
+  "Insert rows, given a seq of hash maps with the same keys, or a column
+  vector and rows of values. Answers the inserted rows. Without :batch this
+  is one INSERT with placeholders for every value; with :batch the statement
+  runs once per row."
+  {:arglists '([connectable table hash-maps]
+               [connectable table hash-maps opts]
+               [connectable table cols rows]
+               [connectable table cols rows opts])}
+  ([connectable table hash-maps] (insert-multi! connectable table hash-maps {}))
+  ([connectable table hash-maps-or-cols opts-or-rows]
+   (if (map? (first hash-maps-or-cols))
+     (let [cols (keys (first hash-maps-or-cols))]
+       (when-not (apply = (map (comp set keys) hash-maps-or-cols))
+         (throw (IllegalArgumentException. "insert-multi! hash maps must all have the same keys")))
+       (insert-multi! connectable table cols
+                      (map (fn [m] (map #(get m %) cols)) hash-maps-or-cols)
+                      opts-or-rows))
+     (if (map? opts-or-rows)
+       (insert-multi! connectable table hash-maps-or-cols [] opts-or-rows)
+       (insert-multi! connectable table hash-maps-or-cols opts-or-rows {}))))
+  ([connectable table cols rows opts]
+   (if (seq rows)
+     (let [opts (assoc opts :return-keys true)]
+       (if (:batch opts)
+         (let [[sql & groups] (b/for-insert-multi table cols rows opts)
+               [sql] (returning [sql] opts)]
+           (njdbc/call-with-connection connectable
+             (fn [w] (into [] (keep #(njdbc/execute-one! w (into [sql] %))) groups))))
+         (njdbc/execute! connectable (returning (b/for-insert-multi table cols rows opts) opts))))
+     [])))
 
 (defn update!
   "Set the columns in key-map on rows matching where-params, a column->value
   map or [where-clause & params]. Answers {:next.jdbc/update-count n}."
   ([connectable table key-map where-params] (update! connectable table key-map where-params {}))
-  ([connectable table key-map where-params _opts]
-   (let [ks (keys key-map)
-         [where & params] (where-clause where-params)]
-     (njdbc/execute-one! connectable
-                         (-> [(str "UPDATE " (name table)
-                                   " SET " (str/join ", " (map #(str (name %) " = ?") ks))
-                                   (when-not (str/blank? where) (str " WHERE " where)))]
-                             (into (map #(get key-map %) ks))
-                             (into params))))))
+  ([connectable table key-map where-params opts]
+   (njdbc/execute-one! connectable (b/for-update table key-map where-params opts) opts)))
 
-(defn- order-by-sql [order-by]
-  (str/join ", " (map (fn [o]
-                        (if (sequential? o)
-                          (let [[col dir] o] (str (name col) " " (str/upper-case (name dir))))
-                          (name o)))
-                      order-by)))
+(defn delete!
+  "Delete rows matching where-params, a column->value map or
+  [where-clause & params]. Answers {:next.jdbc/update-count n}."
+  ([connectable table where-params] (delete! connectable table where-params {}))
+  ([connectable table where-params opts]
+   (njdbc/execute-one! connectable (b/for-delete table where-params opts) opts)))
 
 (defn find-by-keys
   "Rows of table matching key-map: a column->value map, [where-clause & params],
-  or :all. Options: :columns (a seq of column keywords), :order-by (columns or
-  [column :asc|:desc] pairs), :limit and :offset."
+  or :all. Options: :columns, :order-by, :suffix, :table-fn / :column-fn, and
+  the pagination options :top, :limit, :offset and :fetch."
   ([connectable table key-map] (find-by-keys connectable table key-map {}))
   ([connectable table key-map opts]
-   (let [{:keys [columns order-by limit offset]} opts
-         [where & params] (when-not (= :all key-map) (where-clause key-map))]
-     (njdbc/call-with-connection connectable
-      (fn [w]
-       (query w
-            (into [(str "SELECT " (if (seq columns) (str/join ", " (map name columns)) "*")
-                        " FROM " (name table)
-                        (when-not (str/blank? where) (str " WHERE " where))
-                        (when (seq order-by) (str " ORDER BY " (order-by-sql order-by)))
-                        (when limit " LIMIT ?")
-                        ;; sqlite only takes OFFSET after a LIMIT; postgres
-                        ;; rejects a negative one
-                        (when offset
-                          (str (when (and (not limit)
-                                          (= "SQLite" (.getDatabaseProductName (.getMetaData w))))
-                                 " LIMIT -1")
-                               " OFFSET ?")))]
-                  (concat params (when limit [limit]) (when offset [offset])))
-            (dissoc opts :columns :order-by :limit :offset)))))))
+   (with-dialect connectable opts
+     (fn [w opts] (njdbc/execute! w (b/for-query table key-map opts) opts)))))
+
+(defn aggregate-by-keys
+  "The value of a SQL aggregate expression (a string, such as \"count(*)\")
+  over the rows find-by-keys would match. Takes find-by-keys' options except
+  :columns."
+  ([connectable table aggregate key-map] (aggregate-by-keys connectable table aggregate key-map {}))
+  ([connectable table aggregate key-map opts]
+   (when-not (string? aggregate)
+     (throw (IllegalArgumentException. "aggregate-by-keys requires a string aggregate expression")))
+   (when (:columns opts)
+     (throw (IllegalArgumentException. "aggregate-by-keys does not support the :columns option")))
+   (let [total (keyword (str "next_jdbc_aggregate_" (Math/abs (long (hash aggregate)))))]
+     (-> (find-by-keys connectable table key-map (assoc opts :columns [[aggregate total]]))
+         first
+         (get total)))))
 
 (defn get-by-id
-  "The row of table whose pk-name column (default :id) equals pk, or nil."
+  "The row of table whose pk-name column (default :id) equals pk, or nil.
+  Takes find-by-keys' options."
   ([connectable table pk] (get-by-id connectable table pk :id {}))
   ([connectable table pk opts] (get-by-id connectable table pk :id opts))
   ([connectable table pk pk-name opts]

@@ -5,7 +5,10 @@
   (:require [jdbc.core :as jc]
             [next.jdbc :as nj]
             [next.jdbc.sql :as sql]
+            [next.jdbc.sql.builder :as b]
             [db.datasource :as ds]))
+
+(defn- threw? [f] (try (f) :returned (catch Exception _ :threw)))
 
 (defn run [check]
   (println "next.jdbc surface over sqlite (:memory:)")
@@ -100,7 +103,78 @@
            (sql/get-by-id conn :p 42))
     (check "get-by-id with a pk name" "di"
            (:name (sql/get-by-id conn :p "oslo" :city {})))
+
+    (println "next.jdbc.sql pagination, columns and entity fns")
+    (let [names (fn [opts] (mapv :name (sql/find-by-keys conn :p :all (merge {:order-by [:id]} opts))))]
+      (check ":top" ["ada" "bo"] (names {:top 2}))
+      (check ":fetch alone" ["ada" "bo"] (names {:fetch 2}))
+      (check ":offset with :fetch" ["bo" "cy"] (names {:offset 1 :fetch 2}))
+      (check ":limit alone" ["ada"] (names {:limit 1}))
+      (check ":top with a where map keeps the params in order" ["cy"]
+             (mapv :name (sql/find-by-keys conn :p {:age 99} {:order-by [[:id :desc]] :top 1})))
+      (check "conflicting row limits throw" :threw
+             (threw? #(names {:top 1 :limit 1}))))
+    (check ":columns takes [col alias] and [expr alias]" [{:n "ada" :total 1}]
+           (sql/find-by-keys conn :p {:id 1} {:columns [[:name :n] ["1" :total]]}))
+    (check ":table-fn and :column-fn quote entities" [{:name "bo"}]
+           (sql/find-by-keys conn :p {:id 2} {:columns [:name]
+                                              :table-fn #(str "\"" % "\"")
+                                              :column-fn #(str "\"" % "\"")}))
+    (check "get-by-id honours :columns" {:name "ada"}
+           (sql/get-by-id conn :p 1 {:columns [:name]}))
+    (check ":order-by must be a vector" :threw
+           (threw? #(sql/find-by-keys conn :p :all {:order-by '(:id)})))
+    (check "an empty key-map throws" :threw
+           (threw? #(sql/find-by-keys conn :p {})))
+    (check "a suspicious entity throws" :threw
+           (threw? #(sql/find-by-keys conn (keyword "p; drop table p") :all)))
+    (check "aggregate-by-keys answers the value" 2
+           (sql/aggregate-by-keys conn :p "count(*)" {:city "london"}))
+    (check "aggregate-by-keys refuses :columns" :threw
+           (threw? #(sql/aggregate-by-keys conn :p "count(*)" :all {:columns [:id]})))
+
+    (println "next.jdbc.sql insert-multi! and :suffix")
+    (nj/execute! conn "create table m (id integer primary key, a text, b integer)")
+    (check "insert-multi! with hash maps answers the inserted rows"
+           [{:id 1 :a "x" :b 1} {:id 2 :a "y" :b 2}]
+           (sql/insert-multi! conn :m [{:a "x" :b 1} {:a "y" :b 2}]))
+    (check "insert-multi! with cols and rows" [{:id 3 :a "z" :b 3}]
+           (sql/insert-multi! conn :m [:a :b] [["z" 3]]))
+    (check "insert-multi! :batch" [{:id 4 :a "p" :b 4} {:id 5 :a "q" :b 5}]
+           (sql/insert-multi! conn :m [:a :b] [["p" 4] ["q" 5]] {:batch true}))
+    (check "insert-multi! with no rows answers []" []
+           (sql/insert-multi! conn :m [:a :b] []))
+    (check "insert-multi! hash maps with different keys throw" :threw
+           (threw? #(sql/insert-multi! conn :m [{:a "x"} {:b 1}])))
+    (check "insert! :suffix goes before RETURNING" nil
+           (sql/insert! conn :m {:id 1 :a "dup"} {:suffix "ON CONFLICT DO NOTHING"}))
+    (check "update! :suffix (RETURNING answers the row)" {:id 5}
+           (sql/update! conn :m {:b 50} {:id 5} {:suffix "RETURNING id"}))
     (.close conn))
+
+  (println "next.jdbc.sql.builder")
+  (let [lite {:next.jdbc.sql.builder/dialect "SQLite"}
+        pg   {:next.jdbc.sql.builder/dialect "PostgreSQL"}]
+    (check "for-query :top on sqlite" ["SELECT * FROM t WHERE a = ? LIMIT ?" 1 5]
+           (b/for-query :t {:a 1} (merge lite {:top 5})))
+    (check "for-query :offset alone on sqlite" ["SELECT * FROM t LIMIT -1 OFFSET ?" 3]
+           (b/for-query :t :all (merge lite {:offset 3})))
+    (check "for-query :offset alone on postgres" ["SELECT * FROM t OFFSET ?" 3]
+           (b/for-query :t :all (merge pg {:offset 3})))
+    (check "for-query :offset/:fetch" ["SELECT * FROM t ORDER BY a DESC LIMIT ? OFFSET ?" 2 3]
+           (b/for-query :t :all (merge pg {:order-by [[:a :desc]] :offset 3 :fetch 2})))
+    (check "for-query :suffix" ["SELECT * FROM t WHERE x > ? FOR UPDATE" 1]
+           (b/for-query :t ["x > ?" 1] (merge pg {:suffix "FOR UPDATE"})))
+    (check "for-insert" ["INSERT INTO t (a, b) VALUES (?, ?)" 1 2]
+           (b/for-insert :t {:a 1 :b 2} {}))
+    (check "for-insert-multi" ["INSERT INTO t (a, b) VALUES (?, ?), (?, ?)" 1 2 3 4]
+           (b/for-insert-multi :t [:a :b] [[1 2] [3 4]] {}))
+    (check "for-insert-multi :batch groups the rows" ["INSERT INTO t (a, b) VALUES (?, ?)" [1 2] [3 4]]
+           (b/for-insert-multi :t [:a :b] [[1 2] [3 4]] {:batch true}))
+    (check "for-update" ["UPDATE t SET a = ? WHERE b IS NULL AND c = ?" 1 2]
+           (b/for-update :t {:a 1} {:b nil :c 2} {}))
+    (check "for-delete with :table-fn" ["DELETE FROM T WHERE id = ?" 7]
+           (b/for-delete :t ["id = ?" 7] {:table-fn clojure.string/upper-case})))
 
   (println "datasources")
   (let [d (nj/get-datasource {:dbtype "sqlite" :dbname ":memory:"})]
@@ -191,6 +265,17 @@
              (mapv :name (sql/find-by-keys conn :nj_p :all {:order-by [:id] :offset 1})))
       (check "pg find-by-keys :limit and :offset" ["bb"]
              (mapv :name (sql/find-by-keys conn :nj_p :all {:order-by [:id] :limit 1 :offset 1})))
+      (let [names (fn [opts] (mapv :name (sql/find-by-keys conn :nj_p :all (merge {:order-by [:id]} opts))))]
+        (check "pg :top" ["a" "bb"] (names {:top 2}))
+        (check "pg :fetch alone" ["a"] (names {:fetch 1}))
+        (check "pg :offset with :fetch" ["bb"] (names {:offset 1 :fetch 1})))
+      (check "pg aggregate-by-keys" 3 (sql/aggregate-by-keys conn :nj_p "count(*)" :all))
+      (check "pg insert-multi!" ["d" "e"]
+             (mapv :name (sql/insert-multi! conn :nj_p [{:name "d"} {:name "e"}])))
+      (check "pg insert-multi! :batch" ["f" "g"]
+             (mapv :name (sql/insert-multi! conn :nj_p [:name] [["f"] ["g"]] {:batch true})))
+      (check "pg find-by-keys :suffix" ["a"]
+             (mapv :name (sql/find-by-keys conn :nj_p {:id 1} {:suffix "FOR UPDATE"})))
       (nj/execute! conn "drop table nj_p")
       (nj/execute! conn "drop table nj_vals")
       (.close conn))))

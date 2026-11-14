@@ -70,6 +70,38 @@
                (try (sql/query conn "select 1") :still-open
                     (catch Exception _ :closed)))))
 
+  (println "next.jdbc.sql update!/find-by-keys/get-by-id")
+  (let [conn (nj/get-connection "sqlite::memory:")]
+    (nj/execute! conn "create table p (id integer primary key, name text, age integer, city text)")
+    (doseq [r [{:name "ada" :age 36 :city "london"}
+               {:name "bo" :age 20 :city "paris"}
+               {:name "cy" :age 50 :city "london"}
+               {:name "di" :age 41 :city nil}]]
+      (sql/insert! conn :p r))
+    (check "update! with a map where answers the update count" {:next.jdbc/update-count 2}
+           (sql/update! conn :p {:age 99} {:city "london"}))
+    (check "update! with a vector where" {:next.jdbc/update-count 1}
+           (sql/update! conn :p {:city "rome"} ["name = ?" "bo"]))
+    (check "update! with nil in the where map matches IS NULL" {:next.jdbc/update-count 1}
+           (sql/update! conn :p {:city "oslo"} {:city nil}))
+    (check "find-by-keys with a map" ["ada" "cy"]
+           (mapv :name (sql/find-by-keys conn :p {:age 99} {:order-by [:id]})))
+    (check "find-by-keys with a vector where" ["bo"]
+           (mapv :name (sql/find-by-keys conn :p ["age < ?" 30])))
+    (check "find-by-keys :all with :columns, :order-by desc, :limit, :offset" [{:name "cy"} {:name "bo"}]
+           (sql/find-by-keys conn :p :all {:columns [:name] :order-by [[:id :desc]] :limit 2 :offset 1}))
+    (check "find-by-keys :offset without :limit" ["cy" "di"]
+           (mapv :name (sql/find-by-keys conn :p :all {:order-by [:id] :offset 2})))
+    (check "find-by-keys with no match answers []" []
+           (sql/find-by-keys conn :p {:name "nobody"}))
+    (check "get-by-id answers the row" {:id 2 :name "bo" :age 20 :city "rome"}
+           (sql/get-by-id conn :p 2))
+    (check "get-by-id answers nil when missing" nil
+           (sql/get-by-id conn :p 42))
+    (check "get-by-id with a pk name" "di"
+           (:name (sql/get-by-id conn :p "oslo" :city {})))
+    (.close conn))
+
   (println "datasources")
   (let [d (nj/get-datasource {:dbtype "sqlite" :dbname ":memory:"})]
     (check "get-datasource answers instance? DataSource" true
@@ -95,9 +127,15 @@
       (nj/execute! fd "create table di (id integer primary key, x integer)")
       (check "sql/insert! accepts a datasource" {:id 1 :x 7}
              (sql/insert! fd :di {:x 7}))
+      (check "sql/update! accepts a datasource" {:next.jdbc/update-count 1}
+             (sql/update! fd :di {:x 8} {:id 1}))
+      (check "sql/get-by-id accepts a datasource" {:id 1 :x 8}
+             (sql/get-by-id fd :di 1))
+      (check "sql/find-by-keys accepts a datasource" [{:id 1 :x 8}]
+             (sql/find-by-keys fd :di {:x 8}))
       (check "sql/delete! accepts a datasource and a map where-clause"
              {:next.jdbc/update-count 1}
-             (sql/delete! fd :di {:x 7}))
+             (sql/delete! fd :di {:x 8}))
       (check "sql/delete! accepts a [where & params] vector"
              {:next.jdbc/update-count 2}
              (sql/delete! fd :d ["x > ?" 0]))
@@ -143,5 +181,16 @@
              (:c (nj/execute-one! conn ["select ?::text[] as c" ["x" "y z"]])))
       (check "pg execute-batch! over param groups" [1 1]
              (nj/execute-batch! conn "insert into nj_vals (n) values (?::numeric)" [["1"] ["2"]] {}))
+      (nj/execute! conn "drop table if exists nj_p")
+      (nj/execute! conn "create table nj_p (id serial primary key, name text)")
+      (doseq [n ["a" "b" "c"]] (sql/insert! conn :nj_p {:name n}))
+      (check "pg sql/update! answers the update count" {:next.jdbc/update-count 1}
+             (sql/update! conn :nj_p {:name "bb"} {:name "b"}))
+      (check "pg sql/get-by-id" "bb" (:name (sql/get-by-id conn :nj_p 2)))
+      (check "pg find-by-keys :offset without :limit" ["bb" "c"]
+             (mapv :name (sql/find-by-keys conn :nj_p :all {:order-by [:id] :offset 1})))
+      (check "pg find-by-keys :limit and :offset" ["bb"]
+             (mapv :name (sql/find-by-keys conn :nj_p :all {:order-by [:id] :limit 1 :offset 1})))
+      (nj/execute! conn "drop table nj_p")
       (nj/execute! conn "drop table nj_vals")
       (.close conn))))

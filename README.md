@@ -41,11 +41,16 @@ to the update count, exactly as clojure.jdbc does on a driver that has none.
 answers the generated keys map, the whole inserted row, as next.jdbc does;
 `{:return-keys false}` gives `{:next.jdbc/update-count 1}` instead.
 
-`next.jdbc.sql` also has `query`, `update!`, `delete!`, `find-by-keys` and
-`get-by-id`, and like the rest of the `next.jdbc` surface they take a
-connection, a datasource or a db-spec. Where clauses are a column->value map
-(`nil` matches `IS NULL`) or `[sql & params]`. `find-by-keys` takes `:all` and
-the options `:columns`, `:order-by`, `:limit` and `:offset`.
+`next.jdbc.sql` has upstream's full surface: `query`, `insert!`,
+`insert-multi!`, `update!`, `delete!`, `find-by-keys`, `aggregate-by-keys` and
+`get-by-id`, with the builders in `next.jdbc.sql.builder`. Each takes a
+connection, a datasource or a db-spec, and the upstream options: `:columns`
+(including `[col alias]` and `["expr" alias]`), `:order-by`, `:suffix`,
+`:table-fn` / `:column-fn`, `:batch`, and the pagination options `:top`,
+`:limit`, `:offset` and `:fetch`. Upstream writes those in SQL Server, MySQL or
+ANSI syntax; here they all become `LIMIT`/`OFFSET`, which both SQLite and
+PostgreSQL accept, so any of them works on either backend. Only one of `:top`,
+`:limit` and `:fetch` can be given at a time.
 
 ## Migratus
 

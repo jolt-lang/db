@@ -8,7 +8,9 @@
   result-set builder-fns are ignored. Generated keys come back through
   RETURNING *, as neither driver has a generated-keys channel: they are the
   whole inserted row, which is also what postgres' own JDBC driver reports."
-  (:require [jdbc.core :as jc]
+  (:require [db.jdbc-shim :as shim]
+            [jdbc.core :as jc]
+            [jdbc.proto :as proto]
             [next.jdbc :as njdbc]
             [next.jdbc.sql.builder :as b]))
 
@@ -40,11 +42,38 @@
   ([connectable table key-map opts]
    (njdbc/execute-one! connectable (returning (b/for-insert table key-map opts) opts) opts)))
 
+(def ^:private max-rows-per-insert
+  ;; past a few hundred rows a longer VALUES list buys little and costs parse time
+  1000)
+
+(defn- insert-batched
+  "insert-multi! :batch. The rows go in as multi-row INSERTs, as many rows per
+  statement as the parameter limit allows. Every full-size statement shares
+  one SQL string, so those run as one prepared batch; a short tail runs on its
+  own. All of it is one transaction (a savepoint inside an open one)."
+  [connectable table cols rows opts]
+  (njdbc/transact* connectable
+    (fn [tx]
+      (let [opts (dissoc opts :batch)
+            limit (shim/max-params (proto/connection (njdbc/conn-raw tx)))
+            per (max 1 (min max-rows-per-insert (quot limit (count cols))))
+            chunks (partition-all per rows)
+            full (filter #(= per (count %)) chunks)
+            tail (remove #(= per (count %)) chunks)
+            sql-for (fn [chunk] (returning (b/for-insert-multi table cols chunk opts) opts))]
+        (cond-> []
+          (seq full) (into (njdbc/execute-batch! tx (first (sql-for (first full)))
+                                                 (map #(into [] cat %) full)
+                                                 {:return-generated-keys true}))
+          (seq tail) (into (njdbc/execute! tx (sql-for (first tail)))))))
+    {}))
+
 (defn insert-multi!
   "Insert rows, given a seq of hash maps with the same keys, or a column
   vector and rows of values. Answers the inserted rows. Without :batch this
-  is one INSERT with placeholders for every value; with :batch the statement
-  runs once per row."
+  is one INSERT with placeholders for every value; with :batch it is split
+  into multi-row INSERTs that fit the parameter limit, run as one prepared
+  batch in one transaction."
   {:arglists '([connectable table hash-maps]
                [connectable table hash-maps opts]
                [connectable table cols rows]
@@ -65,10 +94,7 @@
    (if (seq rows)
      (let [opts (assoc opts :return-keys true)]
        (if (:batch opts)
-         (let [[sql & groups] (b/for-insert-multi table cols rows opts)
-               [sql] (returning [sql] opts)]
-           (njdbc/call-with-connection connectable
-             (fn [w] (into [] (keep #(njdbc/execute-one! w (into [sql] %))) groups))))
+         (insert-batched connectable table cols rows opts)
          (njdbc/execute! connectable (returning (b/for-insert-multi table cols rows opts) opts))))
      [])))
 

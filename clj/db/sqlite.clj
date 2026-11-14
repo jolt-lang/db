@@ -31,6 +31,10 @@
 (ffi/defcfn sqlite3-changes       "sqlite3_changes"       [:pointer] :int)
 (ffi/defcfn sqlite3-total-changes "sqlite3_total_changes" [:pointer] :int)
 (ffi/defcfn sqlite3-last-rowid    "sqlite3_last_insert_rowid" [:pointer] :int64)
+(ffi/defcfn sqlite3-reset         "sqlite3_reset"         [:pointer] :int)
+(ffi/defcfn sqlite3-clear-bindings "sqlite3_clear_bindings" [:pointer] :int)
+(ffi/defcfn sqlite3-get-autocommit "sqlite3_get_autocommit" [:pointer] :int)
+(ffi/defcfn sqlite3-limit         "sqlite3_limit"         [:pointer :int :int] :int)
 
 (def ^:private SQLITE-OK 0)
 (def ^:private SQLITE-ROW 100)
@@ -89,11 +93,9 @@
   (loop [i 0 acc (transient [])]
     (if (= i n) (persistent! acc) (recur (inc i) (conj! acc (read-value stmt i))))))
 
-(defn query-raw
-  "Run `sql` with `params` (a seq); return {:labels [col-name ...] :rows [[v ...]]}.
-  Column order is preserved, which a JDBC-shaped caller needs to read a row by
-  index. `query` is this with the rows turned into maps."
-  [db sql params]
+(defn- prepare!
+  "Compile `sql` into a sqlite3_stmt*, which the caller finalizes."
+  [db sql]
   (let [pp (ffi/alloc (ffi/sizeof :pointer))
         rc (sqlite3-prepare db sql -1 pp ffi/null)
         stmt (ffi/read pp :pointer)]
@@ -101,19 +103,80 @@
     (when-not (= rc SQLITE-OK)
       (throw (ex-info (str "sqlite prepare failed: " (sqlite3-errmsg db) " — " sql)
                       {:jdbc/sql-error true})))
-    (bind-params! stmt params)
-    (let [ncol (sqlite3-column-count stmt)
-          labels (mapv (fn [i] (sqlite3-column-name stmt i)) (range ncol))]
-      (loop [rows (transient [])]
-        (let [r (sqlite3-step stmt)]
-          (cond
-            (= r SQLITE-ROW)  (recur (conj! rows (read-values stmt ncol)))
-            (= r SQLITE-DONE) (do (sqlite3-finalize stmt)
-                                  {:labels labels :rows (persistent! rows)})
-            :else (let [msg (sqlite3-errmsg db)]
-                    (sqlite3-finalize stmt)
-                    (throw (ex-info (str "sqlite step failed: " msg)
-                                    {:rc r :jdbc/sql-error true})))))))))
+    stmt))
+
+(defn- step-all
+  "Step a bound statement to completion; the rows it produced."
+  [db stmt ncol]
+  (loop [rows (transient [])]
+    (let [r (sqlite3-step stmt)]
+      (cond
+        (= r SQLITE-ROW)  (recur (conj! rows (read-values stmt ncol)))
+        (= r SQLITE-DONE) (persistent! rows)
+        :else (throw (ex-info (str "sqlite step failed: " (sqlite3-errmsg db))
+                              {:rc r :jdbc/sql-error true}))))))
+
+(defn- labels-of [stmt]
+  (let [ncol (sqlite3-column-count stmt)]
+    (mapv (fn [i] (sqlite3-column-name stmt i)) (range ncol))))
+
+(defn query-raw
+  "Run `sql` with `params` (a seq); return {:labels [col-name ...] :rows [[v ...]]}.
+  Column order is preserved, which a JDBC-shaped caller needs to read a row by
+  index. `query` is this with the rows turned into maps."
+  [db sql params]
+  (let [stmt (prepare! db sql)]
+    (try
+      (bind-params! stmt params)
+      (let [labels (labels-of stmt)]
+        {:labels labels :rows (step-all db stmt (count labels))})
+      (finally (sqlite3-finalize stmt)))))
+
+(defn execute-batch
+  "Run `sql` once per parameter group in `groups`, compiling it once and
+  rebinding it for each. Answers a vector of {:labels :rows :count}, one per
+  group, where :count is the rows that group changed.
+
+  Outside a transaction the batch runs inside one, so it lands whole or not at
+  all, and the database file is synced once instead of once per row. Inside a
+  transaction it simply joins it. The test is sqlite's own autocommit state,
+  so a transaction opened with a raw BEGIN counts too."
+  [db sql groups]
+  (if (empty? groups)
+    []
+    (let [own-tx? (= 1 (sqlite3-get-autocommit db))]
+      (when own-tx? (query-raw db "BEGIN" []))
+      (try
+        (let [out (let [stmt (prepare! db sql)]
+                    (try
+                      (let [labels (labels-of stmt)
+                            ncol (count labels)]
+                        (loop [gs (seq groups) out (transient [])]
+                          (if-not gs
+                            (persistent! out)
+                            (let [before (sqlite3-total-changes db)]
+                              (sqlite3-reset stmt)
+                              (sqlite3-clear-bindings stmt)
+                              (bind-params! stmt (first gs))
+                              (let [rows (step-all db stmt ncol)]
+                                (recur (next gs)
+                                       (conj! out {:labels labels :rows rows
+                                                   :count (- (sqlite3-total-changes db) before)})))))))
+                      (finally (sqlite3-finalize stmt))))]
+          (when own-tx? (query-raw db "COMMIT" []))
+          out)
+        (catch Exception e
+          (when (and own-tx? (zero? (sqlite3-get-autocommit db)))
+            (query-raw db "ROLLBACK" []))
+          (throw e))))))
+
+(def ^:private LIMIT-VARIABLE-NUMBER 9)
+
+(defn max-params
+  "The most ? parameters one statement may carry on this connection (999
+  before sqlite 3.32, 32766 since, or whatever the build set)."
+  [db]
+  (sqlite3-limit db LIMIT-VARIABLE-NUMBER -1))
 
 (defn query
   "Run `sql` with `params` (a seq); return a vector of keyword-keyed row maps

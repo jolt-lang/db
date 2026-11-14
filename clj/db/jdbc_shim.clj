@@ -114,6 +114,28 @@
                      :count (if (seq labels) 0 (- (sqlite/total-changes (handle conn)) before))})
       :postgresql (pg/execute-any (handle conn) sql params))))
 
+(defn execute-batch
+  "Run `sql` once per parameter group: compiled once, and on postgres
+  pipelined. Answers [{:labels :rows :count} ...], one per group. Outside a
+  transaction the batch runs in one of its own. A failure is a
+  BatchUpdateException, the class JDBC raises for a batch."
+  [conn sql groups]
+  (try
+    (case (vendor conn)
+      :sqlite     (sqlite/execute-batch (handle conn) sql groups)
+      :postgresql (pg/execute-batch (handle conn) sql groups))
+    (catch Exception e
+      (if (:jdbc/sql-error (ex-data e))
+        (throw (jolt.host/throwable "java.sql.BatchUpdateException" (str (ex-message e))))
+        (throw e)))))
+
+(defn max-params
+  "The most ? parameters one statement may carry on this connection."
+  [conn]
+  (case (vendor conn)
+    :sqlite     (sqlite/max-params (handle conn))
+    :postgresql (pg/max-params (handle conn))))
+
 ;; --- java.sql.ResultSetMetaData ----------------------------------------------
 (defn- make-rsmeta [labels]
   (let [t (tt :jdbc/rsmeta)] (tput! t :labels labels) t))
@@ -231,9 +253,18 @@
                 (tput! self :batch (conj (tget self :batch) (param-vec self)))
                 (tput! self :params {})
                 nil)
+   ;; One prepared statement for the whole batch. When keys were asked for,
+   ;; the RETURNING rows of every group come back from getGeneratedKeys, as
+   ;; they do from a JVM driver after a batch.
    "executeBatch" (fn [self]
-                    (let [conn (tget self :conn) sql (tget self :sql)]
-                      (mapv (fn [ps] (run-update conn sql ps)) (tget self :batch))))
+                    (let [rsql (returning-sql self)
+                          res (execute-batch (tget self :conn) (or rsql (tget self :sql))
+                                             (tget self :batch))]
+                      (tput! self :batch [])
+                      (tput! self :keys (when rsql
+                                          {:labels (or (:labels (first res)) [])
+                                           :rows (into [] (mapcat :rows) res)}))
+                      (mapv :count res)))
 
    "setQueryTimeout" (fn [self _] nil)
    "setFetchSize"    (fn [self _] nil)

@@ -178,7 +178,12 @@
   update counts. The 2-arity also keeps this library's original migratus shape
   — a seq of SQL strings run in order — which predates the upstream contract
   here; param-groups used to be accepted and silently DISCARDED, which is the
-  bug this replaces."
+  bug this replaces.
+
+  The statement is compiled once for the whole batch (pipelined on postgres
+  with libpq 14+), and outside a transaction it runs in one, so it lands whole
+  or not at all. {:return-generated-keys true} answers the rows of a RETURNING
+  clause in the sql instead of the counts."
   ([connectable sqls]
    (if (and (sequential? sqls) (every? string? sqls))
      (call-with-connection connectable
@@ -186,12 +191,16 @@
      (throw (ex-info "execute-batch!: expected a seq of SQL strings, or (execute-batch! conn sql param-groups)"
                      {:arg sqls}))))
   ([connectable sql param-groups] (execute-batch! connectable sql param-groups {}))
-  ([connectable sql param-groups _opts]
+  ([connectable sql param-groups opts]
    (when (sequential? sql)
      (throw (ex-info "execute-batch!: sql must be a single statement; param groups carry the rows"
                      {:sql sql})))
    (call-with-connection connectable
-     (fn [w] (mapv (fn [group] (update-count-of w sql (vec group))) param-groups)))))
+     (fn [w]
+       (let [res (shim/execute-batch (shim-of w) sql (mapv vec param-groups))]
+         (if (:return-generated-keys opts)
+           (into [] (mapcat (fn [{:keys [labels rows]}] (rows->maps labels rows))) res)
+           (mapv :count res)))))))
 
 (defn transact*
   "Run (f tx-connection) in a transaction on the connectable. Options:

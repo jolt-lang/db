@@ -1,5 +1,6 @@
 (ns next.jdbc.sql
-  "The next.jdbc.sql friendly functions (query/insert!/delete!), over jdbc.core.
+  "The next.jdbc.sql friendly functions (query, insert!, update!, delete!,
+  find-by-keys, get-by-id), over jdbc.core.
   Every function takes a connectable, as upstream does: an open connection, a
   datasource or a db-spec (opened and closed per call). next.jdbc result-set
   builder-fns are ignored because jdbc.core already returns unqualified,
@@ -54,3 +55,57 @@
                          (into [(str "DELETE FROM " (name table)
                                      (when-not (str/blank? where) (str " WHERE " where)))]
                                params)))))
+
+(defn update!
+  "Set the columns in key-map on rows matching where-params, a column->value
+  map or [where-clause & params]. Answers {:next.jdbc/update-count n}."
+  ([connectable table key-map where-params] (update! connectable table key-map where-params {}))
+  ([connectable table key-map where-params _opts]
+   (let [ks (keys key-map)
+         [where & params] (where-clause where-params)]
+     (njdbc/execute-one! connectable
+                         (-> [(str "UPDATE " (name table)
+                                   " SET " (str/join ", " (map #(str (name %) " = ?") ks))
+                                   (when-not (str/blank? where) (str " WHERE " where)))]
+                             (into (map #(get key-map %) ks))
+                             (into params))))))
+
+(defn- order-by-sql [order-by]
+  (str/join ", " (map (fn [o]
+                        (if (sequential? o)
+                          (let [[col dir] o] (str (name col) " " (str/upper-case (name dir))))
+                          (name o)))
+                      order-by)))
+
+(defn find-by-keys
+  "Rows of table matching key-map: a column->value map, [where-clause & params],
+  or :all. Options: :columns (a seq of column keywords), :order-by (columns or
+  [column :asc|:desc] pairs), :limit and :offset."
+  ([connectable table key-map] (find-by-keys connectable table key-map {}))
+  ([connectable table key-map opts]
+   (let [{:keys [columns order-by limit offset]} opts
+         [where & params] (when-not (= :all key-map) (where-clause key-map))]
+     (njdbc/call-with-connection connectable
+      (fn [w]
+       (query w
+            (into [(str "SELECT " (if (seq columns) (str/join ", " (map name columns)) "*")
+                        " FROM " (name table)
+                        (when-not (str/blank? where) (str " WHERE " where))
+                        (when (seq order-by) (str " ORDER BY " (order-by-sql order-by)))
+                        (when limit " LIMIT ?")
+                        ;; sqlite only takes OFFSET after a LIMIT; postgres
+                        ;; rejects a negative one
+                        (when offset
+                          (str (when (and (not limit)
+                                          (= "SQLite" (.getDatabaseProductName (.getMetaData w))))
+                                 " LIMIT -1")
+                               " OFFSET ?")))]
+                  (concat params (when limit [limit]) (when offset [offset])))
+            (dissoc opts :columns :order-by :limit :offset)))))))
+
+(defn get-by-id
+  "The row of table whose pk-name column (default :id) equals pk, or nil."
+  ([connectable table pk] (get-by-id connectable table pk :id {}))
+  ([connectable table pk opts] (get-by-id connectable table pk :id opts))
+  ([connectable table pk pk-name opts]
+   (first (find-by-keys connectable table {pk-name pk} opts))))

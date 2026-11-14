@@ -41,6 +41,12 @@ to the update count, exactly as clojure.jdbc does on a driver that has none.
 answers the generated keys map, the whole inserted row, as next.jdbc does;
 `{:return-keys false}` gives `{:next.jdbc/update-count 1}` instead.
 
+`next.jdbc.sql` also has `query`, `update!`, `delete!`, `find-by-keys` and
+`get-by-id`, and like the rest of the `next.jdbc` surface they take a
+connection, a datasource or a db-spec. Where clauses are a column->value map
+(`nil` matches `IS NULL`) or `[sql & params]`. `find-by-keys` takes `:all` and
+the options `:columns`, `:order-by`, `:limit` and `:offset`.
+
 ## Migratus
 
 [migratus](https://github.com/yogthos/migratus) runs on the `next.jdbc` surface

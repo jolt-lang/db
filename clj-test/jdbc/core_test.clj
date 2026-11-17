@@ -164,6 +164,18 @@
     (with-open [conn (jdbc/connection pg-uri)]
       (jdbc/execute! conn "drop table if exists jolt_person")
       (jdbc/execute! conn "create table jolt_person (id serial primary key, name text, zip integer)")
+      ;; a thread waiting on the server must not stop the collector for the
+      ;; others: an allocating thread keeps its pace while a query sleeps
+      (let [stop (atom false) rounds (atom 0)
+            other (future (while (not @stop)
+                            (count (mapv str (range 20000)))
+                            (Thread/sleep 10)
+                            (swap! rounds inc)))]
+        (jdbc/fetch conn "select pg_sleep(1)")
+        (reset! stop true)
+        @other
+        (check (str "pg a waiting query leaves other threads running (" @rounds " rounds in 1 s)")
+               true (> @rounds 20)))
       (check "pg insert! returns a result per row" '(1)
              (jdbc/insert! conn :jolt_person {:name "ada" :zip 94546}))
       (check "pg insert! :returning gives the inserted row" {:id 2 :name "hopper" :zip 3}

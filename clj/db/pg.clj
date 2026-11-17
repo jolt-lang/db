@@ -12,12 +12,21 @@
 ;; startup when present. Its absence is only a problem for a program that actually
 ;; opens a postgres connection: ffi/defcfn resolves a symbol on first call, so this
 ;; namespace loads either way.
+;;
+;; The calls that talk to the server (connect, finish, exec, prepare, the
+;; pipeline sends, sync and getResult) are bound :blocking: they can wait on the
+;; network for as long as a query runs, and a thread waiting inside a call that
+;; is not :blocking stays active, so the collector cannot run and every other
+;; thread that needs it stalls until the query answers. A :blocking call takes
+;; its strings as allocated pointers (with-c-strings below), since a jolt string
+;; may move while the thread is deactivated. The calls that only read client
+;; memory (status, error text, result accessors, clear) stay as they are.
 
-(ffi/defcfn PQconnectdb        "PQconnectdb"        [:string] :pointer)
+(ffi/defcfn PQconnectdb        "PQconnectdb"        [:pointer] :pointer :blocking)
 (ffi/defcfn PQstatus           "PQstatus"           [:pointer] :int)
 (ffi/defcfn PQerrorMessage     "PQerrorMessage"     [:pointer] :string)
-(ffi/defcfn PQfinish           "PQfinish"           [:pointer] :void)
-(ffi/defcfn PQexecParams       "PQexecParams"       [:pointer :string :int :pointer :pointer :pointer :pointer :int] :pointer)
+(ffi/defcfn PQfinish           "PQfinish"           [:pointer] :void :blocking)
+(ffi/defcfn PQexecParams       "PQexecParams"       [:pointer :pointer :int :pointer :pointer :pointer :pointer :int] :pointer :blocking)
 (ffi/defcfn PQresultStatus     "PQresultStatus"     [:pointer] :int)
 (ffi/defcfn PQresultErrorMessage "PQresultErrorMessage" [:pointer] :string)
 (ffi/defcfn PQcmdTuples         "PQcmdTuples"         [:pointer] :string)
@@ -30,16 +39,16 @@
 (ffi/defcfn PQclear            "PQclear"            [:pointer] :void)
 (ffi/defcfn PQlibVersion       "PQlibVersion"       [] :int)
 (ffi/defcfn PQtransactionStatus "PQtransactionStatus" [:pointer] :int)
-(ffi/defcfn PQprepare          "PQprepare"          [:pointer :string :string :int :pointer] :pointer)
-(ffi/defcfn PQexecPrepared     "PQexecPrepared"     [:pointer :string :int :pointer :pointer :pointer :int] :pointer)
+(ffi/defcfn PQprepare          "PQprepare"          [:pointer :pointer :pointer :int :pointer] :pointer :blocking)
+(ffi/defcfn PQexecPrepared     "PQexecPrepared"     [:pointer :pointer :int :pointer :pointer :pointer :int] :pointer :blocking)
 ;; pipeline mode, libpq 14+. Bound lazily like the rest, so an older libpq only
 ;; fails if these are called, and execute-batch checks the version first.
-(ffi/defcfn PQsendPrepare      "PQsendPrepare"      [:pointer :string :string :int :pointer] :int)
-(ffi/defcfn PQsendQueryPrepared "PQsendQueryPrepared" [:pointer :string :int :pointer :pointer :pointer :int] :int)
+(ffi/defcfn PQsendPrepare      "PQsendPrepare"      [:pointer :pointer :pointer :int :pointer] :int :blocking)
+(ffi/defcfn PQsendQueryPrepared "PQsendQueryPrepared" [:pointer :pointer :int :pointer :pointer :pointer :int] :int :blocking)
 (ffi/defcfn PQenterPipelineMode "PQenterPipelineMode" [:pointer] :int)
 (ffi/defcfn PQexitPipelineMode "PQexitPipelineMode" [:pointer] :int)
-(ffi/defcfn PQpipelineSync     "PQpipelineSync"     [:pointer] :int)
-(ffi/defcfn PQgetResult        "PQgetResult"        [:pointer] :pointer)
+(ffi/defcfn PQpipelineSync     "PQpipelineSync"     [:pointer] :int :blocking)
+(ffi/defcfn PQgetResult        "PQgetResult"        [:pointer] :pointer :blocking)
 
 (def ^:private CONNECTION-OK 0)
 (def ^:private PGRES-COMMAND-OK 1)
@@ -66,8 +75,16 @@
    1009 25, 1014 25, 1015 25, 2951 2950
    1115 1114, 1185 1184, 1182 1082, 1183 1083, 1270 1266})
 
+(defn- with-c-strings
+  "Call (apply f ptrs) with each of `strings` copied to NUL-terminated UTF-8
+  memory of its own, freed once f returns or throws."
+  [strings f]
+  (let [ptrs (mapv ffi/string->ptr strings)]
+    (try (apply f ptrs)
+         (finally (doseq [p ptrs] (ffi/free p))))))
+
 (defn connect [uri]
-  (let [conn (PQconnectdb uri)]
+  (let [conn (with-c-strings [uri] PQconnectdb)]
     (when-not (= CONNECTION-OK (PQstatus conn))
       (let [msg (PQerrorMessage conn)] (PQfinish conn)
         (throw (ex-info (str "pg connect failed: " msg) {:jdbc/sql-error true}))))
@@ -310,9 +327,12 @@
 (defn- run [conn sql params]
   (let [[types values lengths formats owned] (param-arrays params)
         ;; callers write JDBC ? placeholders; postgres wants $1..$N
-        res (PQexecParams conn (pg-placeholders sql) (count params)
-                          types values lengths formats 0)]
-    (doseq [p owned] (ffi/free p))
+        res (try
+              (with-c-strings [(pg-placeholders sql)]
+                (fn [sql*]
+                  (PQexecParams conn sql* (count params)
+                                types values lengths formats 0)))
+              (finally (doseq [p owned] (ffi/free p))))]
     (let [st (PQresultStatus res)]
       (when-not (or (= st PGRES-COMMAND-OK) (= st PGRES-TUPLES-OK))
         (let [msg (PQresultErrorMessage res)] (PQclear res)
@@ -486,8 +506,11 @@
 
 (defn- send-group! [conn group]
   (let [[_ values lengths formats owned] (param-arrays group)
-        ok (PQsendQueryPrepared conn "" (count group) values lengths formats 0)]
-    (doseq [p owned] (ffi/free p))
+        ok (try
+             (with-c-strings [""]
+               (fn [stmt]
+                 (PQsendQueryPrepared conn stmt (count group) values lengths formats 0)))
+             (finally (doseq [p owned] (ffi/free p))))]
     (when-not (= 1 ok)
       (throw (ex-info (str "pg send failed: " (PQerrorMessage conn)) {:jdbc/sql-error true})))))
 
@@ -517,7 +540,8 @@
     (throw (ex-info (str "pg could not enter pipeline mode: " (PQerrorMessage conn))
                     {:jdbc/sql-error true})))
   (try
-    (when-not (= 1 (PQsendPrepare conn "" sql n types))
+    (when-not (= 1 (with-c-strings ["" sql]
+                     (fn [stmt sql*] (PQsendPrepare conn stmt sql* n types))))
       (throw (ex-info (str "pg send failed: " (PQerrorMessage conn)) {:jdbc/sql-error true})))
     (loop [chunks (partition-all pipeline-chunk groups) out [] first? true]
       (if-not (seq chunks)
@@ -540,11 +564,16 @@
     (finally (PQexitPipelineMode conn))))
 
 (defn- batch-serial [conn sql groups n types]
-  (PQclear (check-result! (PQprepare conn "" sql n types) sql))
+  (PQclear (check-result! (with-c-strings ["" sql]
+                            (fn [stmt sql*] (PQprepare conn stmt sql* n types)))
+                          sql))
   (mapv (fn [g]
           (let [[_ values lengths formats owned] (param-arrays g)
-                res (PQexecPrepared conn "" (count g) values lengths formats 0)]
-            (doseq [p owned] (ffi/free p))
+                res (try
+                      (with-c-strings [""]
+                        (fn [stmt]
+                          (PQexecPrepared conn stmt (count g) values lengths formats 0)))
+                      (finally (doseq [p owned] (ffi/free p))))]
             (check-result! res sql)
             (let [r (group-result res)] (PQclear res) r)))
         groups))

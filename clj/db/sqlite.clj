@@ -9,11 +9,20 @@
 ;; this namespace is required, so the bindings below resolve.
 
 ;; --- bindings ----------------------------------------------------------------
-(ffi/defcfn sqlite3-open          "sqlite3_open"          [:string :pointer] :int)
-(ffi/defcfn sqlite3-close         "sqlite3_close"         [:pointer] :int)
+;;
+;; open, close, prepare and step are bound :blocking: they can wait on the disk,
+;; on another connection's lock (sqlite sleeps inside them under busy_timeout),
+;; or run a long query. A thread inside a call that is not :blocking stays
+;; active, so the collector cannot run and every other thread that needs it
+;; stalls until the call returns. A :blocking call takes its strings as
+;; allocated pointers (with-c-string below), since a jolt string may move while
+;; the thread is deactivated. The rest only touch memory sqlite already holds.
+
+(ffi/defcfn sqlite3-open          "sqlite3_open"          [:pointer :pointer] :int :blocking)
+(ffi/defcfn sqlite3-close         "sqlite3_close"         [:pointer] :int :blocking)
 (ffi/defcfn sqlite3-errmsg        "sqlite3_errmsg"        [:pointer] :string)
-(ffi/defcfn sqlite3-prepare       "sqlite3_prepare_v2"    [:pointer :string :int :pointer :pointer] :int)
-(ffi/defcfn sqlite3-step          "sqlite3_step"          [:pointer] :int)
+(ffi/defcfn sqlite3-prepare       "sqlite3_prepare_v2"    [:pointer :pointer :int :pointer :pointer] :int :blocking)
+(ffi/defcfn sqlite3-step          "sqlite3_step"          [:pointer] :int :blocking)
 (ffi/defcfn sqlite3-finalize      "sqlite3_finalize"      [:pointer] :int)
 (ffi/defcfn sqlite3-column-count  "sqlite3_column_count"  [:pointer] :int)
 (ffi/defcfn sqlite3-column-name   "sqlite3_column_name"   [:pointer :int] :string)
@@ -45,12 +54,19 @@
 (def ^:private TY-INT 1) (def ^:private TY-FLOAT 2) (def ^:private TY-BLOB 4) (def ^:private TY-NULL 5)
 
 ;; --- connection --------------------------------------------------------------
+(defn- with-c-string
+  "Call (f ptr) with `s` copied to NUL-terminated UTF-8 memory of its own,
+  freed once f returns or throws."
+  [s f]
+  (let [ptr (ffi/string->ptr s)]
+    (try (f ptr) (finally (ffi/free ptr)))))
+
 (defn open
   "Open `path` (a file or \":memory:\"). Returns the sqlite3* pointer."
   [path]
   (let [pp (ffi/alloc (ffi/sizeof :pointer))]
     (try
-      (let [rc (sqlite3-open path pp)
+      (let [rc (with-c-string path #(sqlite3-open % pp))
             db (ffi/read pp :pointer)]
         (when-not (= rc SQLITE-OK)
           (throw (ex-info (str "sqlite open failed: " path)
@@ -97,9 +113,10 @@
   "Compile `sql` into a sqlite3_stmt*, which the caller finalizes."
   [db sql]
   (let [pp (ffi/alloc (ffi/sizeof :pointer))
-        rc (sqlite3-prepare db sql -1 pp ffi/null)
-        stmt (ffi/read pp :pointer)]
-    (ffi/free pp)
+        [rc stmt] (try
+                    [(with-c-string sql #(sqlite3-prepare db % -1 pp ffi/null))
+                     (ffi/read pp :pointer)]
+                    (finally (ffi/free pp)))]
     (when-not (= rc SQLITE-OK)
       (throw (ex-info (str "sqlite prepare failed: " (sqlite3-errmsg db) " — " sql)
                       {:jdbc/sql-error true})))

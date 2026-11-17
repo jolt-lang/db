@@ -101,6 +101,32 @@
     (check "set-rollback! discards the block" 0
            (count (jdbc/fetch conn ["select * from person where name = ?" "marked"]))))
 
+  ;; a thread waiting inside sqlite (here on another connection's write lock,
+  ;; under busy_timeout) must not stop the collector for the others
+  (println "sqlite waits leave other threads running")
+  (let [f (str "/tmp/jolt-busy-" (System/currentTimeMillis) ".db")]
+    (with-open [holder (jdbc/connection {:vendor "sqlite" :name f})
+                waiter (jdbc/connection {:vendor "sqlite" :name f})]
+      (jdbc/execute! holder "create table t (x integer)")
+      (jdbc/fetch waiter "pragma busy_timeout = 1000")
+      (jdbc/execute! holder "begin immediate")
+      (let [stop (atom false) rounds (atom 0)
+            other (future (while (not @stop)
+                            (count (mapv str (range 20000)))
+                            (Thread/sleep 10)
+                            (swap! rounds inc)))
+            busy (try (jdbc/execute! waiter "insert into t values (1)") nil
+                      (catch Exception e (ex-message e)))]
+        (reset! stop true)
+        @other
+        (check "sqlite a locked write still times out as busy" true
+               (boolean (and busy (re-find #"locked" busy))))
+        (check (str "sqlite a write waiting on a lock leaves other threads running ("
+                    @rounds " rounds in 1 s)")
+               true (> @rounds 20)))
+      (jdbc/execute! holder "rollback"))
+    (.delete (java.io.File. f)))
+
   (println "dbspec parsing")
   (check "map spec works" '(1)
          (with-open [c (jdbc/connection {:vendor "sqlite" :name ":memory:"})]
